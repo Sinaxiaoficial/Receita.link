@@ -1,0 +1,248 @@
+require('dotenv').config();
+const express = require('express');
+const cors = require('cors');
+const multer = require('multer');
+const { GoogleGenAI } = require('@google/genai');
+const fs = require('fs');
+const path = require('path');
+const axios = require('axios');
+
+const app = express();
+app.use(cors());
+app.use(express.json());
+const upload = multer({ dest: '/tmp/' });
+
+const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+
+const PROMPT = `Você é um chef de cozinha e nutricionista especializado em estruturação de dados culinários. Eu vou te fornecer as informações de uma receita extraída de um vídeo.
+       
+Sua tarefa:
+1. Extrair o título da receita e o rendimento. Avaliar e calcular as calorias TOTAIS estimadas da receita inteira.
+2. Listar todos os ingredientes com quantidades e unidades de medida. Divida em seções (ex: Massa). Para cada ingrediente, calcule as calorias reais estimadas.
+3. Escrever um modo de preparo extremamente detalhado e lógico preenchendo as lacunas do vídeo.
+
+Regra de Saída:
+Retorne o resultado EXCLUSIVAMENTE em formato JSON, sem marcações Markdown (\`\`\`json), seguindo estritamente esta estrutura:
+{
+  "titulo": "Nome da Receita",
+  "rendimento": "Ex: 8 porções",
+  "calorias_totais": "Ex: 2500 kcal",
+  "ingredientes": [
+    { 
+      "secao": "Massa", 
+      "itens": [
+        { "descricao": "2 xícaras de cenoura", "kcal": "100 kcal" },
+        { "descricao": "1 xícara de óleo", "kcal": "1900 kcal" }
+      ] 
+    }
+  ],
+  "modo_preparo": [
+    { "secao": "Massa", "passos": ["Pré-aqueça o forno a 180°C...", "No liquidificador..."] }
+  ]
+}`;
+
+app.post('/api/recipe/audio', upload.single('audio'), async (req, res) => {
+  if (!req.file) {
+    return res.status(400).json({ error: 'Nenhum arquivo de áudio enviado.' });
+  }
+
+  const filePath = req.file.path;
+  const mimeType = req.file.mimetype || 'audio/mp3'; // Default to mp3 if not provided
+
+  try {
+    console.log(`Processing file: ${filePath} with mimeType: ${mimeType}`);
+    
+    // Upload the file to Gemini
+    const uploadedFile = await ai.files.upload({
+        file: filePath,
+        mimeType: mimeType
+    });
+    
+    console.log(`File uploaded to Gemini successfully: ${uploadedFile.name}`);
+
+    // Wait for the file to be processed
+    let file = await ai.files.get({ name: uploadedFile.name });
+    while (file.state === 'PROCESSING') {
+        process.stdout.write('.')
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+        file = await ai.files.get({ name: uploadedFile.name })
+    }
+    
+    if (file.state === 'FAILED') {
+        throw new Error('File processing failed on Gemini servers.');
+    }
+
+    console.log('\nGenerating content...');
+
+    const response = await ai.models.generateContent({
+      model: 'gemini-2.5-flash',
+      contents: [
+        {
+           role: 'user',
+           parts: [
+               { fileData: { fileUri: uploadedFile.uri, mimeType: uploadedFile.mimeType } },
+               { text: PROMPT }
+           ]
+        }
+      ]
+    });
+
+    // Cleanup: Delete the file from Gemini
+    await ai.files.delete({ name: uploadedFile.name });
+    fs.unlinkSync(filePath); // Delete local file
+    
+    let textResponse = response.text;
+    console.log("Raw Gemini Response:", textResponse);
+
+    if (textResponse.includes('\`\`\`json')) {
+        textResponse = textResponse.split('\`\`\`json')[1].split('\`\`\`')[0].trim();
+    } else if (textResponse.includes('\`\`\`')) {
+         textResponse = textResponse.split('\`\`\`')[1].split('\`\`\`')[0].trim();
+    }
+
+    const recipeData = JSON.parse(textResponse);
+    res.json(recipeData);
+
+  } catch (error) {
+    console.error('Error processing audio:', error);
+    // Attempt cleanup if error occurred
+     if (fs.existsSync(filePath)) {
+         fs.unlinkSync(filePath);
+     }
+    res.status(500).json({ error: 'Failed to process audio and generate recipe.', details: error.message });
+  }
+});
+
+app.post('/api/recipe/url', async (req, res) => {
+    const { url } = req.body;
+    if(!url) return res.status(400).json({error: "URL is required"});
+    
+    try {
+        console.log(`Processing URL: ${url}`);
+        
+        // 1. Get TikTok video data from TikWM API
+        const tikwmResponse = await axios.get('https://www.tikwm.com/api/', {
+            params: { url: url, hd: 1 }
+        });
+
+        if (tikwmResponse.data.code !== 0 || !tikwmResponse.data.data?.play) {
+            throw new Error('Falha ao obter vídeo do TikTok. Verifique se o link é válido.');
+        }
+
+        const videoUrl = tikwmResponse.data.data.play;
+        const tempFilename = `temp_${Date.now()}.mp4`;
+        const tempFilePath = path.join('/tmp', tempFilename);
+
+        console.log(`Downloading video to ${tempFilePath}...`);
+        
+        // 2. Download video
+        const videoResponse = await axios({
+            url: videoUrl,
+            method: 'GET',
+            responseType: 'stream'
+        });
+
+        const writer = fs.createWriteStream(tempFilePath);
+        videoResponse.data.pipe(writer);
+
+        await new Promise((resolve, reject) => {
+            writer.on('finish', resolve);
+            writer.on('error', reject);
+        });
+
+        console.log(`Video downloaded. Uploading to Gemini...`);
+
+        // 3. Upload to Gemini
+        const uploadedFile = await ai.files.upload({
+           file: tempFilePath,
+           mimeType: 'video/mp4'
+        });
+
+        console.log(`File uploaded to Gemini successfully: ${uploadedFile.name}`);
+
+        // Wait for the file to be processed
+        let file = await ai.files.get({ name: uploadedFile.name });
+        while (file.state === 'PROCESSING') {
+            process.stdout.write('.')
+            await new Promise((resolve) => setTimeout(resolve, 2000));
+            file = await ai.files.get({ name: uploadedFile.name })
+        }
+        
+        if (file.state === 'FAILED') {
+            throw new Error('File processing failed on Gemini servers.');
+        }
+        
+        console.log('\nGenerating content...');
+
+        // 4. Generate Content
+        const response = await ai.models.generateContent({
+           model: 'gemini-2.5-flash',
+           contents: [
+             {
+                role: 'user',
+                parts: [
+                    { fileData: { fileUri: uploadedFile.uri, mimeType: uploadedFile.mimeType } },
+                    { text: PROMPT }
+                ]
+             }
+           ]
+        });
+
+        // Cleanup
+        await ai.files.delete({ name: uploadedFile.name });
+        if (fs.existsSync(tempFilePath)) {
+            fs.unlinkSync(tempFilePath);
+        }
+
+        let textResponse = response.text;
+        console.log("Raw Gemini Response:", textResponse);
+
+        if (textResponse.includes('```json')) {
+            textResponse = textResponse.split('```json')[1].split('```')[0].trim();
+        } else if (textResponse.includes('```')) {
+             textResponse = textResponse.split('```')[1].split('```')[0].trim();
+        }
+
+        const recipeData = JSON.parse(textResponse);
+        res.json(recipeData);
+
+    } catch (error) {
+        console.error('Error processing URL:', error);
+        res.status(500).json({ error: 'Failed to process URL and generate recipe.', details: error.message });
+    }
+});
+
+app.post('/api/recipe/text', async (req, res) => {
+    const { text } = req.body;
+    if (!text) return res.status(400).json({ error: "Text is required" });
+
+    try {
+        const response = await ai.models.generateContent({
+            model: 'gemini-2.5-flash',
+            contents: `${PROMPT}\n\nTexto/Transcrição:\n${text}`
+        });
+
+        let textResponse = response.text;
+        
+        if (textResponse.includes('\`\`\`json')) {
+            textResponse = textResponse.split('\`\`\`json')[1].split('\`\`\`')[0].trim();
+        } else if (textResponse.includes('\`\`\`')) {
+            textResponse = textResponse.split('\`\`\`')[1].split('\`\`\`')[0].trim();
+        }
+
+        const recipeData = JSON.parse(textResponse);
+        res.json(recipeData);
+
+    } catch (error) {
+         console.error('Error processing text:', error);
+         res.status(500).json({ error: 'Failed to process text and generate recipe.', details: error.message });
+    }
+});
+
+const PORT = process.env.PORT || 3001;
+if (process.env.NODE_ENV !== 'production') {
+  app.listen(PORT, () => {
+    console.log(`Backend server running on port ${PORT}`);
+  });
+}
+module.exports = app;
