@@ -49,7 +49,7 @@ function App() {
       const apiUrl = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:3001');
       const response = await axios.post(`${apiUrl}/api/recipe/url`, { url }, {
         headers: { 'Content-Type': 'application/json' },
-        timeout: 55000, // 55s — dentro do limite de 60s do servidor
+        timeout: 290000, // 290s — margem de 10s antes do limite de 300s do Vercel Pro
       });
       setRecipe(response.data);
     } catch (err) {
@@ -226,7 +226,7 @@ function App() {
                   <Utensils className="absolute inset-0 m-auto w-6 h-6 text-blue-600 animate-pulse" />
                 </div>
                 <p className="text-slate-600 font-medium tracking-wide animate-pulse">O Chef de IA está ouvindo o TikTok e anotando tudo...</p>
-                <p className="text-sm text-slate-500 max-w-sm mx-auto animate-pulse">Vídeos curtos levam ~15s. Vídeos maiores (2-3 min) podem levar até 40s. ⚡</p>
+                <p className="text-sm text-slate-500 max-w-sm mx-auto animate-pulse">Vídeos curtos levam ~15s. Vídeos maiores (2-3 min) podem levar até 1 minuto. ⚡</p>
               </div>
             )}
           </div>

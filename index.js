@@ -90,7 +90,7 @@ async function callGeminiWithRetry(requestFn, maxRetries = 3) {
         || (err.message && (err.message.includes('503') || err.message.includes('429') || err.message.includes('high demand') || err.message.includes('overloaded')));
 
       if (isRetryable && attempt < maxRetries) {
-        const delay = Math.pow(2, attempt) * 1500;
+        const delay = Math.pow(2, attempt) * 1000;
         console.warn(`[Gemini] ⚠️  Tentativa ${attempt}/${maxRetries} falhou (${status || err.message}). Retentando em ${delay/1000}s...`);
         await new Promise(r => setTimeout(r, delay));
       } else {
@@ -197,7 +197,7 @@ async function downloadTikTokMedia(url) {
 
   const response = await axios.get('https://www.tikwm.com/api/', {
     params: { url, hd: 0 },
-    timeout: 10000
+    timeout: 15000
   });
 
   if (response.data.code !== 0 || !response.data.data) {
@@ -223,7 +223,7 @@ async function downloadTikTokMedia(url) {
     url: videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 12000  // Otimizado: fail-fast sem quebrar downloads legítimos
+    timeout: 30000  // Aumentado para suportar vídeos grandes no Vercel Pro
   });
 
   const sizeMB = (videoResponse.data.byteLength / (1024 * 1024)).toFixed(1);
@@ -256,7 +256,7 @@ async function downloadViaTikWMPost(url) {
       'Referer': 'https://www.tikwm.com/'
     },
     data: `url=${encodeURIComponent(url)}&count=12&cursor=0&web=1&hd=0`,
-    timeout: 10000
+    timeout: 15000
   });
 
   if (response.data.code !== 0 || !response.data.data) {
@@ -276,7 +276,7 @@ async function downloadViaTikWMPost(url) {
     url: videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 12000  // Otimizado
+    timeout: 30000  // Aumentado para suportar vídeos grandes no Vercel Pro
   });
 
   return {
@@ -301,7 +301,7 @@ async function downloadViaTTSave(url) {
         'Content-Type': 'application/json',
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
       },
-      timeout: 10000
+      timeout: 15000
     }
   );
 
@@ -323,7 +323,7 @@ async function downloadViaTTSave(url) {
     url: downloadMatch[1],
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 12000,  // Otimizado: fail-fast
+    timeout: 30000,  // Aumentado para suportar vídeos grandes no Vercel Pro
     headers: {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
@@ -409,7 +409,7 @@ app.post('/api/recipe/audio', upload.single('audio'), async (req, res) => {
         responseSchema: RECIPE_SCHEMA,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0,
-        maxOutputTokens: 1500
+        maxOutputTokens: 4000
       }
     }));
 
@@ -502,7 +502,7 @@ app.post('/api/recipe/url', async (req, res) => {
             responseMimeType: "application/json",
             responseSchema: RECIPE_SCHEMA,
             temperature: 0,
-            maxOutputTokens: 1500
+            maxOutputTokens: 4000
           }
         }));
 
@@ -567,7 +567,7 @@ app.post('/api/recipe/url', async (req, res) => {
         responseSchema: RECIPE_SCHEMA,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0,
-        maxOutputTokens: 1500
+        maxOutputTokens: 4000
       }
     }));
 
@@ -609,9 +609,23 @@ app.post('/api/recipe/url', async (req, res) => {
     res.json(recipeData);
 
   } catch (error) {
-    console.error('Error processing URL:', error);
+    console.error('Error processing URL:', error.message || error);
+
+    let userError = 'Ocorreu um erro interno ao processar a receita. Tente novamente.';
+    const msg = error.message || '';
+
+    if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNABORTED')) {
+      userError = 'O processamento excedeu o tempo limite. Isso pode acontecer com vídeos muito longos. Tente novamente — a segunda tentativa costuma ser mais rápida.';
+    } else if (msg.includes('Unterminated string') || msg.includes('JSON') || msg.includes('Unexpected token')) {
+      userError = 'A receita gerada foi muito longa e foi cortada. Tente novamente — normalmente funciona na segunda tentativa.';
+    } else if (msg.includes('503') || msg.includes('429') || msg.includes('overloaded') || msg.includes('RESOURCE_EXHAUSTED')) {
+      userError = 'O serviço de IA está temporariamente sobrecarregado. Aguarde alguns segundos e tente novamente.';
+    } else if (msg.includes('SAFETY') || msg.includes('blocked')) {
+      userError = 'O conteúdo do vídeo foi bloqueado pelo filtro de segurança da IA. Tente com outro vídeo.';
+    }
+
     res.status(500).json({
-      error: 'Ocorreu um erro interno ao processar a receita. Tente novamente.',
+      error: userError,
       details: error.message
     });
   }
@@ -641,7 +655,7 @@ app.post('/api/recipe/text', async (req, res) => {
         responseSchema: RECIPE_SCHEMA,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0,
-        maxOutputTokens: 1500
+        maxOutputTokens: 4000
       }
     }));
 
