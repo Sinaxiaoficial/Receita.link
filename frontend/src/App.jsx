@@ -36,8 +36,16 @@ function App() {
 
   const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!url) {
-      setError('Por favor, cole um link válido do TikTok.');
+    const trimmedUrl = url.trim();
+
+    if (!trimmedUrl) {
+      setError('Por favor, cole um link do TikTok.');
+      return;
+    }
+
+    // Validação customizada em PT-BR — evita a mensagem nativa do browser em inglês
+    if (!/tiktok\.com/i.test(trimmedUrl)) {
+      setError('Por favor, insira um link válido do TikTok (ex: https://www.tiktok.com/@user/video/...).');
       return;
     }
 
@@ -198,7 +206,7 @@ function App() {
                <div className="relative bg-white border border-slate-200 p-2 pl-4 rounded-2xl flex items-center shadow-lg transition-all focus-within:ring-2 focus-within:ring-blue-500 focus-within:border-blue-500">
                  <Link2 className="w-6 h-6 text-slate-400 shrink-0" />
                  <input 
-                   type="url" 
+                   type="text" 
                    placeholder="Cole o link do TikTok aqui..."
                    value={url}
                    onChange={(e) => setUrl(e.target.value)}

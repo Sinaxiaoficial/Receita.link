@@ -7,6 +7,22 @@ const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
 
+// ========================================================================
+// User-Agent Rotation — evita fingerprinting por provedores
+// ========================================================================
+
+const USER_AGENTS = [
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
+  'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:126.0) Gecko/20100101 Firefox/126.0',
+  'Mozilla/5.0 (iPhone; CPU iPhone OS 17_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.5 Mobile/15E148 Safari/604.1'
+];
+
+function getRandomUserAgent() {
+  return USER_AGENTS[Math.floor(Math.random() * USER_AGENTS.length)];
+}
+
 const app = express();
 app.use(cors());
 app.use(express.json());
@@ -32,7 +48,8 @@ O conteúdo pode vir de MÚLTIPLAS fontes: áudio/narração do vídeo, texto vi
 4. Seja conciso e direto no modo de preparo. Não adicione textos enrolados, vá direto ao ponto (isso acelera a extração).
 5. O título DEVE ser extraído do vídeo ou da legenda. Se não mencionado, descreva de forma direta (ex: "Bolo de Chocolate").
 6. Para ingredientes, quantidades e modo de preparo: extraia SOMENTE o que é explicitamente dito, mostrado ou escrito na legenda. Para calorias (kcal), você PODE estimar com base em valores nutricionais padrão — mas NUNCA invente ingredientes ou passos.
-7. Escreva o modo de preparo com ortografia, gramática e concordância corretas no português, mesmo que a pessoa no vídeo fale com gírias, erros ou de forma informal.`;
+7. Escreva o modo de preparo com ortografia, gramática e concordância corretas no português, mesmo que a pessoa no vídeo fale com gírias, erros ou de forma informal.
+8. Se o vídeo contém MÚLTIPLAS receitas (compilação), extraia apenas a PRIMEIRA receita completa identificada (com ingredientes e modo de preparo). Ignore as demais receitas do vídeo.`;
 
 const RECIPE_SCHEMA = {
   type: Type.OBJECT,
@@ -184,20 +201,46 @@ async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
 }
 
 // ========================================================================
+// Resolução de URLs encurtadas (vm.tiktok.com, vt.tiktok.com)
+// ========================================================================
+
+async function resolveShortUrl(url) {
+  if (/^https?:\/\/(vm|vt)\.tiktok\.com\//i.test(url)) {
+    console.log('[URL] 🔗 Link encurtado detectado — resolvendo redirect...');
+    try {
+      const response = await axios.get(url, {
+        maxRedirects: 10,
+        timeout: 10000,
+        headers: { 'User-Agent': getRandomUserAgent() },
+        validateStatus: () => true,
+      });
+      const finalUrl = response.request?.res?.responseUrl || response.request?.responseURL || url;
+      console.log(`[URL] ✅ Resolvido para: ${finalUrl}`);
+      return finalUrl;
+    } catch (err) {
+      console.warn(`[URL] ⚠️  Falha ao resolver link encurtado (${err.message}) — tentando URL original`);
+      return url;
+    }
+  }
+  return url;
+}
+
+// ========================================================================
 // TikTok Audio/Video Download (Audio-First Strategy)
 // ========================================================================
 
 /**
- * Tenta extrair ÁUDIO primeiro (muito mais rápido).
- * Fallback para vídeo SD caso áudio não disponível.
+ * TikWM GET — provedor principal.
  */
 async function downloadTikTokMedia(url) {
   console.log('[TikWM] Buscando metadata...');
   const startTime = Date.now();
+  const ua = getRandomUserAgent();
 
   const response = await axios.get('https://www.tikwm.com/api/', {
     params: { url, hd: 0 },
-    timeout: 15000
+    timeout: 15000,
+    headers: { 'User-Agent': ua }
   });
 
   if (response.data.code !== 0 || !response.data.data) {
@@ -211,8 +254,6 @@ async function downloadTikTokMedia(url) {
   // ── SEMPRE baixar o VÍDEO ──
   // O campo "music" do TikWM retorna apenas a trilha sonora/música de fundo,
   // NÃO a narração do criador. A fala real está no track de áudio do vídeo.
-  // Enviar apenas a música fazia o Gemini receber conteúdo sem receita
-  // e alucinar/inventar uma receita para satisfazer o prompt.
   const videoUrl = data.play;
   if (!videoUrl) {
     throw new Error('TikWM: nenhuma URL de vídeo encontrada');
@@ -223,7 +264,8 @@ async function downloadTikTokMedia(url) {
     url: videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000  // Aumentado para suportar vídeos grandes no Vercel Pro
+    timeout: 30000,
+    headers: { 'User-Agent': ua }
   });
 
   const sizeMB = (videoResponse.data.byteLength / (1024 * 1024)).toFixed(1);
@@ -245,12 +287,13 @@ async function downloadTikTokMedia(url) {
  */
 async function downloadViaTikWMPost(url) {
   console.log('[TikWM-POST] Tentando...');
+  const ua = getRandomUserAgent();
   const response = await axios({
     method: 'post',
     url: 'https://www.tikwm.com/api/',
     headers: {
       'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8',
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'User-Agent': ua,
       'Accept': 'application/json, text/javascript, */*; q=0.01',
       'Origin': 'https://www.tikwm.com',
       'Referer': 'https://www.tikwm.com/'
@@ -276,7 +319,8 @@ async function downloadViaTikWMPost(url) {
     url: videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000  // Aumentado para suportar vídeos grandes no Vercel Pro
+    timeout: 30000,
+    headers: { 'User-Agent': ua }
   });
 
   return {
@@ -294,12 +338,13 @@ async function downloadViaTikWMPost(url) {
  */
 async function downloadViaTTSave(url) {
   console.log('[TTSave] Tentando...');
+  const ua = getRandomUserAgent();
   const response = await axios.post('https://ttsave.app/download',
     { id: url, locale: 'en', tt: 'ttsave' },
     {
       headers: {
         'Content-Type': 'application/json',
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+        'User-Agent': ua
       },
       timeout: 15000
     }
@@ -323,10 +368,8 @@ async function downloadViaTTSave(url) {
     url: downloadMatch[1],
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000,  // Aumentado para suportar vídeos grandes no Vercel Pro
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
+    timeout: 30000,
+    headers: { 'User-Agent': ua }
   });
 
   return {
@@ -340,33 +383,97 @@ async function downloadViaTTSave(url) {
 }
 
 /**
- * Download paralelo: lança TODOS os provedores ao mesmo tempo.
- * Resolve IMEDIATAMENTE quando qualquer provedor retorna áudio (mais rápido).
- * Se nenhum tiver áudio, aguarda todos e usa o primeiro vídeo.
+ * TikCDN/SSSTik — provedor alternativo adicional
+ */
+async function downloadViaTikCDN(url) {
+  console.log('[TikCDN] Tentando via tikcdn.io...');
+  const ua = getRandomUserAgent();
+
+  // Passo 1: obter o formulário do SSSTik
+  const formResponse = await axios.post('https://ssstik.io/abc?url=dl', 
+    `id=${encodeURIComponent(url)}&locale=en&tt=ssstik`,
+    {
+      headers: {
+        'Content-Type': 'application/x-www-form-urlencoded',
+        'User-Agent': ua,
+        'Origin': 'https://ssstik.io',
+        'Referer': 'https://ssstik.io/'
+      },
+      timeout: 15000
+    }
+  );
+
+  const html = typeof formResponse.data === 'string' ? formResponse.data : '';
+
+  // Extrair link de download sem watermark
+  const downloadMatch = html.match(/href="(https:\/\/[^"]*(?:tikcdn|ssstik)[^"]*)"/) ||
+    html.match(/href="(https:\/\/[^"]*\.mp4[^"]*)"/);
+
+  if (!downloadMatch || !downloadMatch[1]) {
+    throw new Error('TikCDN: não encontrou link de download');
+  }
+
+  // Extrair autor se disponível
+  const authorMatch = html.match(/@([a-zA-Z0-9_.]+)/);
+  const author = authorMatch ? authorMatch[1] : null;
+
+  // Extrair descrição se disponível
+  const descMatch = html.match(/class="maintext"[^>]*>([^<]+)</);
+  const description = descMatch ? descMatch[1].trim() : '';
+
+  console.log('[TikCDN] ⬇️  Baixando vídeo...');
+  const videoResponse = await axios({
+    url: downloadMatch[1],
+    method: 'GET',
+    responseType: 'arraybuffer',
+    timeout: 30000,
+    headers: { 'User-Agent': ua, 'Referer': 'https://ssstik.io/' }
+  });
+
+  return {
+    buffer: Buffer.from(videoResponse.data),
+    mimeType: 'video/mp4',
+    type: 'video',
+    author: author ? `@${author}` : null,
+    title: null,
+    description
+  };
+}
+
+/**
+ * Download sequencial com fallback: tenta cada provedor em ordem.
+ * Se todos falharem, lança erro com detalhes de cada falha.
  */
 async function downloadTikTokMedia_Sequential(url) {
   const providers = [
     { name: 'TikWM', fn: downloadTikTokMedia },
-    { name: 'TTSave', fn: downloadViaTTSave },
     { name: 'TikWM-POST', fn: downloadViaTikWMPost },
+    { name: 'TikCDN', fn: downloadViaTikCDN },
+    { name: 'TTSave', fn: downloadViaTTSave },
   ];
 
-  console.log('[Fallback] 🚀 Iniciando download sequencial...');
+  console.log('[Fallback] 🚀 Iniciando download sequencial com ' + providers.length + ' provedores...');
   const errors = [];
 
   for (const provider of providers) {
     try {
       console.log(`[Fallback] Tentando provedor: ${provider.name}...`);
       const result = await provider.fn(url);
-      console.log(`[Fallback] ✅ Sucesso com ${provider.name}`);
+      console.log(`[Fallback] ✅ Sucesso com ${provider.name} (${(result.buffer.length / (1024*1024)).toFixed(1)}MB)`);
       return result;
     } catch (err) {
-      console.error(`[Fallback] ❌ Falha em ${provider.name}: ${err.message}`);
-      errors.push(`${provider.name}: ${err.message}`);
+      const errMsg = err.message || String(err);
+      console.error(`[Fallback] ❌ Falha em ${provider.name}: ${errMsg}`);
+      errors.push(`${provider.name}: ${errMsg}`);
     }
   }
 
-  throw new Error(`Nenhum provedor conseguiu baixar o vídeo.\nDetalhes:\n${errors.join('\n')}`);
+  // Categorizar o erro para mensagens mais úteis ao usuário
+  const allErrors = errors.join('\n');
+  const isRateLimit = /429|rate.?limit|too many|blocked|forbidden|403/i.test(allErrors);
+  const downloadError = new Error(`Nenhum provedor conseguiu baixar o vídeo.\nDetalhes:\n${allErrors}`);
+  downloadError.isRateLimit = isRateLimit;
+  throw downloadError;
 }
 
 // ========================================================================
@@ -433,7 +540,7 @@ app.post('/api/recipe/audio', upload.single('audio'), async (req, res) => {
 
 app.post('/api/recipe/url', async (req, res) => {
   let { url } = req.body;
-  if (!url) return res.status(400).json({ error: "URL é obrigatória." });
+  if (!url) return res.status(400).json({ error: "URL é obrigatória.", errorCode: 'INVALID_INPUT' });
 
   // ── Sanitização de URL ──
   // Extrai apenas o link caso o usuário tenha colado um texto junto (ex: "Olha essa receita: https...")
@@ -444,6 +551,16 @@ app.post('/api/recipe/url', async (req, res) => {
   // Remove pontuações no final do link (como vírgula, ponto, etc.)
   url = url.replace(/[,.!?;:]+$/, '').trim();
 
+  // ── Validar domínio TikTok ──
+  if (!/tiktok\.com/i.test(url)) {
+    return res.status(400).json({
+      error: 'Por favor, insira um link válido do TikTok (ex: https://www.tiktok.com/@user/video/...).',
+      errorCode: 'INVALID_URL'
+    });
+  }
+
+  // ── Resolver links encurtados (vm.tiktok.com, vt.tiktok.com) ──
+  url = await resolveShortUrl(url);
 
   // ── Verificar cache ──
   const cached = getCachedRecipe(url);
@@ -457,14 +574,19 @@ app.post('/api/recipe/url', async (req, res) => {
     console.log(`[URL] Processando: ${url}`);
     console.log(`========================================`);
 
-    // 1. Download da mídia (prioriza áudio)
+    // 1. Download da mídia
     let mediaData;
     try {
       mediaData = await downloadTikTokMedia_Sequential(url);
     } catch (downloadError) {
-      console.error('Todos os provedores falharam:', downloadError.message);
+      console.error('[Download] ❌ Todos os provedores falharam:', downloadError.message);
+      const errorMsg = downloadError.isRateLimit
+        ? 'O TikTok está bloqueando downloads temporariamente. Tente novamente em alguns minutos.'
+        : 'Não foi possível baixar o vídeo do TikTok. Verifique se o link é válido e se o vídeo é público.';
+      const errorCode = downloadError.isRateLimit ? 'DOWNLOAD_BLOCKED' : 'DOWNLOAD_FAILED';
       return res.status(400).json({
-        error: 'Não foi possível baixar o vídeo do TikTok. Verifique se o link está completo e se o vídeo é público. Se o problema persistir, tente novamente em alguns minutos.',
+        error: errorMsg,
+        errorCode,
         debug_error: downloadError.message
       });
     }
@@ -580,16 +702,21 @@ app.post('/api/recipe/url', async (req, res) => {
     // Verificar se o Gemini indicou que não encontrou receita
     if (recipeData.erro) {
       console.warn(`[Gemini] ⚠️  Nenhuma receita encontrada: ${recipeData.erro}`);
-      return res.status(400).json({
-        error: 'Não foi possível identificar uma receita neste vídeo. Verifique se o vídeo contém uma receita culinária com ingredientes e modo de preparo.'
-      });
+      // Detectar se é uma compilação com múltiplas receitas
+      const isCompilation = /múltiplas|compilação|várias receitas|multiple|compilation/i.test(recipeData.erro);
+      const errorMsg = isCompilation
+        ? 'Este vídeo parece conter múltiplas receitas. Tente com um vídeo que contenha uma única receita.'
+        : 'O vídeo não contém uma receita clara com ingredientes e modo de preparo. Verifique se o vídeo é de uma receita culinária.';
+      const errorCode = isCompilation ? 'MULTIPLE_RECIPES' : 'NO_RECIPE';
+      return res.status(400).json({ error: errorMsg, errorCode });
     }
 
     // Validação básica: verificar se a receita tem estrutura mínima
     if (!recipeData.titulo || !recipeData.ingredientes || !recipeData.modo_preparo) {
       console.warn('[Gemini] ⚠️  Resposta sem estrutura de receita válida');
       return res.status(400).json({
-        error: 'O vídeo não parece conter uma receita completa. Tente com um vídeo que mostre ingredientes e modo de preparo.'
+        error: 'O vídeo não parece conter uma receita completa. Tente com um vídeo que mostre ingredientes e modo de preparo.',
+        errorCode: 'NO_RECIPE'
       });
     }
 
@@ -609,23 +736,33 @@ app.post('/api/recipe/url', async (req, res) => {
     res.json(recipeData);
 
   } catch (error) {
-    console.error('Error processing URL:', error.message || error);
+    console.error('[Error] ❌ Erro ao processar URL:', error.message || error);
+    if (error.stack) console.error('[Error] Stack:', error.stack);
 
     let userError = 'Ocorreu um erro interno ao processar a receita. Tente novamente.';
+    let errorCode = 'INTERNAL_ERROR';
     const msg = error.message || '';
 
     if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNABORTED')) {
-      userError = 'O processamento excedeu o tempo limite. Isso pode acontecer com vídeos muito longos. Tente novamente — a segunda tentativa costuma ser mais rápida.';
+      userError = 'O processamento excedeu o tempo limite. Vídeos muito longos podem não ser suportados. Tente com um vídeo mais curto ou tente novamente.';
+      errorCode = 'TIMEOUT';
     } else if (msg.includes('Unterminated string') || msg.includes('JSON') || msg.includes('Unexpected token')) {
       userError = 'A receita gerada foi muito longa e foi cortada. Tente novamente — normalmente funciona na segunda tentativa.';
+      errorCode = 'AI_TRUNCATED';
     } else if (msg.includes('503') || msg.includes('429') || msg.includes('overloaded') || msg.includes('RESOURCE_EXHAUSTED')) {
       userError = 'O serviço de IA está temporariamente sobrecarregado. Aguarde alguns segundos e tente novamente.';
+      errorCode = 'AI_OVERLOADED';
     } else if (msg.includes('SAFETY') || msg.includes('blocked')) {
       userError = 'O conteúdo do vídeo foi bloqueado pelo filtro de segurança da IA. Tente com outro vídeo.';
+      errorCode = 'SAFETY_BLOCKED';
+    } else if (msg.includes('File API') || msg.includes('upload')) {
+      userError = 'Não foi possível processar o vídeo. O arquivo pode ser muito grande. Tente com um vídeo mais curto.';
+      errorCode = 'UPLOAD_FAILED';
     }
 
     res.status(500).json({
       error: userError,
+      errorCode,
       details: error.message
     });
   }
