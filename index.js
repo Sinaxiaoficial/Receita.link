@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { GoogleGenAI, Type } = require('@google/genai');
+const { GoogleGenAI, Type, MediaResolution } = require('@google/genai');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -231,15 +231,16 @@ async function resolveShortUrl(url) {
 
 /**
  * TikWM GET — provedor principal.
+ * Busca só os dados do vídeo (link, autor, legenda). O download do vídeo é feito
+ * à parte, para a legenda poder ser lida enquanto o vídeo ainda está baixando.
  */
-async function downloadTikTokMedia(url) {
+async function fetchTikWMMeta(url) {
   console.log('[TikWM] Buscando metadata...');
-  const startTime = Date.now();
   const ua = getRandomUserAgent();
 
   const response = await axios.get('https://www.tikwm.com/api/', {
     params: { url, hd: 0 },
-    timeout: 15000,
+    timeout: 10000,
     headers: { 'User-Agent': ua }
   });
 
@@ -248,24 +249,33 @@ async function downloadTikTokMedia(url) {
   }
 
   const data = response.data.data;
-  const author = data.author?.unique_id || null;
-  const title = data.title || null;
 
   // ── SEMPRE baixar o VÍDEO ──
   // O campo "music" do TikWM retorna apenas a trilha sonora/música de fundo,
   // NÃO a narração do criador. A fala real está no track de áudio do vídeo.
-  const videoUrl = data.play;
-  if (!videoUrl) {
+  if (!data.play) {
     throw new Error('TikWM: nenhuma URL de vídeo encontrada');
   }
 
+  return {
+    videoUrl: data.play,
+    ua,
+    author: data.author?.unique_id || null,
+    title: data.title || null,
+    description: data.title || ''
+  };
+}
+
+async function downloadTikWMVideo(meta) {
   console.log('[Video] ⬇️  Baixando vídeo SD...');
+  const startTime = Date.now();
+
   const videoResponse = await axios({
-    url: videoUrl,
+    url: meta.videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
     timeout: 30000,
-    headers: { 'User-Agent': ua }
+    headers: { 'User-Agent': meta.ua }
   });
 
   const sizeMB = (videoResponse.data.byteLength / (1024 * 1024)).toFixed(1);
@@ -276,9 +286,9 @@ async function downloadTikTokMedia(url) {
     buffer: Buffer.from(videoResponse.data),
     mimeType: 'video/mp4',
     type: 'video',
-    author,
-    title,
-    description: data.title || ''
+    author: meta.author,
+    title: meta.title,
+    description: meta.description
   };
 }
 
@@ -441,31 +451,38 @@ async function downloadViaTikCDN(url) {
 }
 
 /**
- * Download sequencial com fallback: tenta cada provedor em ordem.
+ * Download com fallback em paralelo: usado quando o TikWM GET falha.
+ * Todos os provedores alternativos são tentados ao mesmo tempo e vence o primeiro
+ * que entregar o vídeo — assim um provedor fora do ar não trava os outros.
  * Se todos falharem, lança erro com detalhes de cada falha.
  */
-async function downloadTikTokMedia_Sequential(url) {
+async function downloadWithFallbacks(url) {
   const providers = [
-    { name: 'TikWM', fn: downloadTikTokMedia },
     { name: 'TikWM-POST', fn: downloadViaTikWMPost },
     { name: 'TikCDN', fn: downloadViaTikCDN },
     { name: 'TTSave', fn: downloadViaTTSave },
   ];
 
-  console.log('[Fallback] 🚀 Iniciando download sequencial com ' + providers.length + ' provedores...');
+  console.log('[Fallback] 🚀 Tentando ' + providers.length + ' provedores em paralelo...');
   const errors = [];
 
-  for (const provider of providers) {
-    try {
-      console.log(`[Fallback] Tentando provedor: ${provider.name}...`);
-      const result = await provider.fn(url);
-      console.log(`[Fallback] ✅ Sucesso com ${provider.name} (${(result.buffer.length / (1024*1024)).toFixed(1)}MB)`);
-      return result;
-    } catch (err) {
-      const errMsg = err.message || String(err);
-      console.error(`[Fallback] ❌ Falha em ${provider.name}: ${errMsg}`);
-      errors.push(`${provider.name}: ${errMsg}`);
-    }
+  try {
+    return await Promise.any(providers.map(provider =>
+      provider.fn(url).then(
+        result => {
+          console.log(`[Fallback] ✅ Sucesso com ${provider.name} (${(result.buffer.length / (1024*1024)).toFixed(1)}MB)`);
+          return result;
+        },
+        err => {
+          const errMsg = err.message || String(err);
+          console.error(`[Fallback] ❌ Falha em ${provider.name}: ${errMsg}`);
+          errors.push(`${provider.name}: ${errMsg}`);
+          throw err;
+        }
+      )
+    ));
+  } catch (e) {
+    // Promise.any só rejeita quando todos falharam — os erros já estão em "errors"
   }
 
   // Categorizar o erro para mensagens mais úteis ao usuário
@@ -474,6 +491,67 @@ async function downloadTikTokMedia_Sequential(url) {
   const downloadError = new Error(`Nenhum provedor conseguiu baixar o vídeo.\nDetalhes:\n${allErrors}`);
   downloadError.isRateLimit = isRateLimit;
   throw downloadError;
+}
+
+// ========================================================================
+// Rota rápida pela legenda
+// ========================================================================
+
+// Legenda com receita (>100 chars + palavras-chave) pode ser processada só como TEXTO (1-3s).
+function captionLooksLikeRecipe(description) {
+  return !!description
+    && description.length > 100
+    && /ingredientes?|modo de preparo|colher|xícara|gramas?|\bg\b|\bml\b|\bkg\b/i.test(description);
+}
+
+/**
+ * Extrai a receita só do texto da legenda.
+ * Retorna a receita se ela tiver ingredientes E modo de preparo; senão retorna null
+ * (ex: a legenda só tem a lista de ingredientes) e o vídeo é usado para completar.
+ */
+async function extractRecipeFromCaption(description, author) {
+  console.log(`[Smart Route] ⚡ Legenda contém receita — processando como TEXTO`);
+  const geminiStart = Date.now();
+
+  try {
+    const response = await callGeminiWithRetry(() => ai.models.generateContent({
+      model: MODEL,
+      contents: [{
+        role: 'user',
+        parts: [{
+          text: `Extraia a receita do texto abaixo (legenda de um vídeo do TikTok). Ingredientes e modo de preparo devem vir SOMENTE do texto. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.\n\n${description}`
+        }]
+      }],
+      config: {
+        systemInstruction: SYSTEM_INSTRUCTION,
+        responseMimeType: "application/json",
+        responseSchema: RECIPE_SCHEMA,
+        thinkingConfig: { thinkingBudget: 0 },
+        temperature: 0,
+        maxOutputTokens: 4000
+      }
+    }));
+
+    const textResult = JSON.parse(response.text);
+    const geminiElapsed = ((Date.now() - geminiStart) / 1000).toFixed(1);
+    console.log(`[Smart Route] ✅ Gemini-texto respondeu em ${geminiElapsed}s`);
+
+    const hasIngredients = textResult.ingredientes
+      && textResult.ingredientes.some(sec => sec.itens && sec.itens.length > 0);
+    const hasSteps = textResult.modo_preparo
+      && textResult.modo_preparo.some(sec => sec.passos && sec.passos.length > 0);
+
+    if (!textResult.erro && textResult.titulo && hasIngredients && hasSteps) {
+      if (author) {
+        textResult.creditos_autor = author.startsWith('@') ? author : `@${author}`;
+      }
+      return textResult;
+    }
+    console.log(`[Smart Route] ⚠️  Legenda não gerou receita válida — fallback para vídeo`);
+  } catch (captionErr) {
+    console.warn(`[Smart Route] ⚠️  Falha no processamento da legenda: ${captionErr.message} — fallback para vídeo`);
+  }
+  return null;
 }
 
 // ========================================================================
@@ -574,10 +652,39 @@ app.post('/api/recipe/url', async (req, res) => {
     console.log(`[URL] Processando: ${url}`);
     console.log(`========================================`);
 
-    // 1. Download da mídia
+    // 1. Dados do vídeo (link + legenda) primeiro; o download do vídeo começa
+    //    logo em seguida e corre em paralelo com a leitura da legenda.
+    let meta = null;
+    try {
+      meta = await fetchTikWMMeta(url);
+    } catch (metaErr) {
+      console.warn(`[TikWM] ⚠️  ${metaErr.message} — usando provedores alternativos`);
+    }
+
+    const mediaPromise = meta
+      ? downloadTikWMVideo(meta).catch(err => {
+          console.warn(`[Video] ⚠️  Download pelo TikWM falhou (${err.message}) — usando provedores alternativos`);
+          return downloadWithFallbacks(url);
+        })
+      : downloadWithFallbacks(url);
+    // Evita "unhandled rejection" quando a legenda resolve e o vídeo nunca é aguardado
+    mediaPromise.catch(() => {});
+
+    // 2. ROTA RÁPIDA: legenda com receita → responde sem esperar o vídeo
+    if (meta && captionLooksLikeRecipe(meta.description)) {
+      const captionRecipe = await extractRecipeFromCaption(meta.description, meta.author);
+      if (captionRecipe) {
+        setCachedRecipe(url, captionRecipe);
+        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`\n🏁 TOTAL: ${totalElapsed}s [FAST PATH — legenda]\n`);
+        return res.json(captionRecipe);
+      }
+    }
+
+    // 3. Esperar o download do vídeo
     let mediaData;
     try {
-      mediaData = await downloadTikTokMedia_Sequential(url);
+      mediaData = await mediaPromise;
     } catch (downloadError) {
       console.error('[Download] ❌ Todos os provedores falharam:', downloadError.message);
       const errorMsg = downloadError.isRateLimit
@@ -599,58 +706,14 @@ app.post('/api/recipe/url', async (req, res) => {
       console.log(`[Legenda] ⚠️  Sem descrição/legenda disponível`);
     }
 
-    // ── ROTA INTELIGENTE: Legenda com receita → processar como TEXTO (1-2s) ──
-    // Se a legenda contém ingredientes/receita (>100 chars + palavras-chave),
-    // processa apenas o texto — PULA o vídeo inteiro (economiza 10-15s).
-    const captionHasRecipe = mediaData.description 
-      && mediaData.description.length > 100
-      && /ingredientes?|modo de preparo|colher|xícara|gramas?|\bg\b|\bml\b|\bkg\b/i.test(mediaData.description);
-
-    if (captionHasRecipe) {
-      console.log(`[Smart Route] ⚡ Legenda contém receita — processando como TEXTO (skip vídeo)`);
-      const geminiStart = Date.now();
-
-      try {
-        const response = await callGeminiWithRetry(() => ai.models.generateContent({
-          model: MODEL,
-          contents: [{
-            role: 'user',
-            parts: [{
-              text: `Extraia a receita do texto abaixo (legenda de um vídeo do TikTok). Ingredientes e modo de preparo devem vir SOMENTE do texto. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.\n\n${mediaData.description}`
-            }]
-          }],
-          config: {
-            systemInstruction: SYSTEM_INSTRUCTION,
-            responseMimeType: "application/json",
-            responseSchema: RECIPE_SCHEMA,
-            temperature: 0,
-            maxOutputTokens: 4000
-          }
-        }));
-
-        const textResult = JSON.parse(response.text);
-        const geminiElapsed = ((Date.now() - geminiStart) / 1000).toFixed(1);
-        console.log(`[Smart Route] ✅ Receita extraída da legenda em ${geminiElapsed}s`);
-
-        // Validar: se a extração da legenda retornou uma receita válida (com ingredientes E modo de preparo), usar direto.
-        // Caso contrário (ex: a legenda só tem a lista de ingredientes), faz o fallback para o vídeo para extrair o resto.
-        const hasIngredients = textResult.ingredientes 
-          && textResult.ingredientes.some(sec => sec.itens && sec.itens.length > 0);
-        const hasSteps = textResult.modo_preparo 
-          && textResult.modo_preparo.some(sec => sec.passos && sec.passos.length > 0);
-
-        if (!textResult.erro && textResult.titulo && hasIngredients && hasSteps) {
-          if (mediaData.author) {
-            textResult.creditos_autor = mediaData.author.startsWith('@') ? mediaData.author : `@${mediaData.author}`;
-          }
-          setCachedRecipe(url, textResult);
-          const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
-          console.log(`\n🏁 TOTAL: ${totalElapsed}s (download: ${downloadElapsed}s, gemini-texto: ${geminiElapsed}s) [FAST PATH]\n`);
-          return res.json(textResult);
-        }
-        console.log(`[Smart Route] ⚠️  Legenda não gerou receita válida — fallback para vídeo`);
-      } catch (captionErr) {
-        console.warn(`[Smart Route] ⚠️  Falha no processamento da legenda: ${captionErr.message} — fallback para vídeo`);
+    // Legenda vinda de um provedor alternativo (o TikWM falhou, então ela ainda não foi lida)
+    if (!meta && captionLooksLikeRecipe(mediaData.description)) {
+      const captionRecipe = await extractRecipeFromCaption(mediaData.description, mediaData.author);
+      if (captionRecipe) {
+        setCachedRecipe(url, captionRecipe);
+        const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
+        console.log(`\n🏁 TOTAL: ${totalElapsed}s (download: ${downloadElapsed}s) [FAST PATH — legenda]\n`);
+        return res.json(captionRecipe);
       }
     }
 
@@ -659,7 +722,9 @@ app.post('/api/recipe/url', async (req, res) => {
     const geminiStart = Date.now();
 
     const mediaSizeMB = mediaData.buffer.length / (1024 * 1024);
-    const USE_FILE_API_THRESHOLD_MB = 8;
+    // Envio direto (inline) é bem mais rápido que a File API, mas o pedido ao Gemini
+    // tem limite de 20MB e o base64 aumenta o arquivo em ~33% → até 14MB cabe.
+    const USE_FILE_API_THRESHOLD_MB = 14;
 
     let contentParts;
 
@@ -687,6 +752,8 @@ app.post('/api/recipe/url', async (req, res) => {
         systemInstruction: SYSTEM_INSTRUCTION,
         responseMimeType: "application/json",
         responseSchema: RECIPE_SCHEMA,
+        // Resolução baixa: ~4x menos dados por quadro → IA responde mais rápido. O áudio não muda.
+        mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0,
         maxOutputTokens: 4000
