@@ -42,7 +42,8 @@ const API_KEYS = [...new Set(
     .filter(Boolean).join(',')
     .split(/[\s,;]+/).map(k => k.trim()).filter(Boolean)
 )];
-const MODELS = (process.env.GEMINI_MODELS || 'gemini-3.5-flash-lite,gemini-2.5-flash-lite')
+// gemini-2.5-flash-lite foi desativado pelo Google (404). Reservas atuais: outro "lite" e um flash.
+const MODELS = (process.env.GEMINI_MODELS || 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash')
   .split(/[\s,;]+/).map(m => m.trim()).filter(Boolean);
 const MODEL = MODELS[0];
 const geminiClients = API_KEYS.map(apiKey => new GoogleGenAI({ apiKey }));
@@ -82,7 +83,9 @@ function adaptConfigForModel(config, model) {
   const budget = config.thinkingConfig.thinkingBudget;
   if (budget === undefined) return config;
   const L = ThinkingLevel || { MINIMAL: 'MINIMAL', LOW: 'LOW', MEDIUM: 'MEDIUM' };
-  const thinkingLevel = budget === 0 ? L.MINIMAL : budget <= 1024 ? L.LOW : L.MEDIUM;
+  // MINIMAL só é aceito pelos modelos "lite"; nos outros o mínimo é LOW.
+  const minimal = /lite/.test(model) ? L.MINIMAL : L.LOW;
+  const thinkingLevel = budget === 0 ? minimal : budget <= 1024 ? L.LOW : L.MEDIUM;
   return { ...config, thinkingConfig: { thinkingLevel } };
 }
 
@@ -115,23 +118,32 @@ async function generateWithRotation(request) {
       const ki = (currentKey + n) % geminiClients.length;
       const slot = `${ki}#${model}`;
       if ((blockedUntil.get(slot) || 0) > Date.now()) continue;
-      try {
-        const contents = await partsForKey(request.contents, ki);
-        const response = await geminiClients[ki].models.generateContent({
-          ...request, model, contents, config: adaptConfigForModel(request.config, model)
-        });
-        if (ki !== currentKey) console.log(`[Gemini] 🔁 Agora usando a chave ${ki + 1}`);
-        currentKey = ki;
-        return response;
-      } catch (err) {
-        const c = classifyGeminiError(err);
-        if (c.kind === 'other') throw err;
-        if (c.kind !== 'quota') onlyQuota = false;
-        if (c.blockMs) blockedUntil.set(slot, Date.now() + c.blockMs);
-        console.warn(`[Gemini] ⚠️  Chave ${ki + 1} / ${model}: ${c.kind}${c.daily ? ' (limite diário)' : ''} — tentando a próxima`);
-        lastErr = err;
-        if (c.kind === 'model') break; // modelo indisponível: vai direto ao próximo modelo
+      let c = null;
+      // "Alta demanda" (503) é do MODELO, não da chave: espera um pouco e tenta de novo
+      // na mesma chave (trocar de chave obrigaria a reenviar o vídeo, ~20s cada vez).
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        try {
+          const contents = await partsForKey(request.contents, ki);
+          const response = await geminiClients[ki].models.generateContent({
+            ...request, model, contents, config: adaptConfigForModel(request.config, model)
+          });
+          if (ki !== currentKey) console.log(`[Gemini] 🔁 Agora usando a chave ${ki + 1}`);
+          if (model !== MODELS[0]) console.log(`[Gemini] 🔁 Respondido pelo modelo reserva ${model}`);
+          currentKey = ki;
+          return response;
+        } catch (err) {
+          c = classifyGeminiError(err);
+          lastErr = err;
+          if (c.kind === 'other') throw err;
+          console.warn(`[Gemini] ⚠️  Chave ${ki + 1} / ${model}: ${c.kind}${c.daily ? ' (limite diário)' : ''} — ${String(err.message || '').slice(0, 160)}`);
+          if (c.kind !== 'overloaded' || attempt === 3) break;
+          await new Promise(r => setTimeout(r, attempt * 3000));
+        }
       }
+      if (c.kind !== 'quota') onlyQuota = false;
+      if (c.blockMs) blockedUntil.set(slot, Date.now() + c.blockMs);
+      // Modelo fora do ar ou sobrecarregado: as outras chaves teriam o mesmo problema → próximo modelo.
+      if (c.kind === 'model' || c.kind === 'overloaded') break;
     }
   }
   const err = lastErr || new Error('Todas as chaves do Gemini estão no limite agora');
