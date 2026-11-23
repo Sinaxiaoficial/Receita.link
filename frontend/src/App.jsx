@@ -12,7 +12,9 @@ function estimateSeconds(info) {
   if (!info) return 30;
   if (info.captionHasRecipe) return 10;
   if (!info.duration) return 30;
-  return Math.round(Math.min(240, 15 + info.duration * 0.15));
+  // Medido: vídeo de 12 min levou ~2,5 min. Vídeos longos recebem uma folga maior.
+  const perSecond = info.duration >= LONG_VIDEO_SECONDS ? 0.2 : 0.15;
+  return Math.round(Math.min(270, 15 + info.duration * perSecond));
 }
 
 function formatSeconds(total) {
@@ -296,7 +298,7 @@ function App() {
                 {isLongVideo && (
                   <div className="max-w-md mx-auto px-5 py-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-sm font-medium">
                     {knownLong
-                      ? `Este vídeo é grande (${Math.round(videoInfo.duration / 60)} min), por isso pode demorar um pouco mais — cerca de ${formatSeconds(estimate)} no total.`
+                      ? `Este vídeo é grande (${Math.round(videoInfo.duration / 60)} min), por isso pode demorar um pouco mais — cerca de ${formatSeconds(estimate >= 60 ? Math.round(estimate / 30) * 30 : estimate)} no total.`
                       : 'Este vídeo parece ser grande, por isso pode demorar um pouco mais.'}
                     {' '}Deixe esta página aberta. ⏳
                   </div>
