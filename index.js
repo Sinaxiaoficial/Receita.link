@@ -77,8 +77,31 @@ function classifyGeminiError(err) {
   return { kind: 'other', blockMs: 0 };
 }
 
+// Converte o schema do SDK (Type.OBJECT...) para JSON Schema padrão, mantendo a ordem
+// dos campos (propertyOrdering). Testado em 23/11/2026: com "responseSchema" o
+// gemini-3.5-flash-lite responde 503 "alta demanda" em todo pedido com vídeo; com
+// "responseJsonSchema" o MESMO pedido responde em ~6s, com as quantidades certas.
+function toJsonSchema(sch) {
+  if (!sch || typeof sch !== 'object') return sch;
+  const out = {};
+  if (sch.type) out.type = String(sch.type).toLowerCase();
+  if (sch.description) out.description = sch.description;
+  if (sch.items) out.items = toJsonSchema(sch.items);
+  if (sch.properties) {
+    const order = sch.propertyOrdering || Object.keys(sch.properties);
+    const keys = [...order, ...Object.keys(sch.properties).filter(k => !order.includes(k))];
+    out.properties = {};
+    for (const k of keys) if (sch.properties[k]) out.properties[k] = toJsonSchema(sch.properties[k]);
+  }
+  return out;
+}
+
 // Modelos Gemini 3 não aceitam thinkingBudget: 0 — usam "nível de raciocínio".
 function adaptConfigForModel(config, model) {
+  if (config && config.responseSchema) {
+    const { responseSchema, ...rest } = config;
+    config = { ...rest, responseJsonSchema: toJsonSchema(responseSchema) };
+  }
   if (!config || !config.thinkingConfig || !/gemini-3|-latest$/.test(model)) return config;
   const budget = config.thinkingConfig.thinkingBudget;
   if (budget === undefined) return config;
