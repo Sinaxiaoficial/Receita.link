@@ -284,6 +284,7 @@ async function transcribeSpeech(mediaPart) {
   }));
   const text = (response.text || '').trim();
   console.log(`[Transcrição] 📝 ${text.length} caracteres em ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  console.log(`[Transcrição] início: ${text.slice(0, 1500).replace(/\s+/g, ' ')}`);
   return text;
 }
 
@@ -1036,6 +1037,7 @@ ${JSON.stringify(recipeData.modo_preparo)}` }] }],
         }));
         const ingData = JSON.parse(ingResponse.text);
         const newQty = ingredientsWithoutQuantity(ingData);
+        console.log(`[Gemini] Lista refeita: ${(ingData.ingredientes || []).flatMap(sec => (sec.itens || []).map(i => i.descricao)).join(' | ')}`);
         if (newQty.total > 0 && (qty.total === 0 || newQty.missing < qty.missing)) {
           recipeData.ingredientes = ingData.ingredientes;
           if (ingData.calorias_totais) recipeData.calorias_totais = ingData.calorias_totais;
