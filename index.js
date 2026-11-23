@@ -43,7 +43,7 @@ const API_KEYS = [...new Set(
     .split(/[\s,;]+/).map(k => k.trim()).filter(Boolean)
 )];
 // gemini-2.5-flash-lite foi desativado pelo Google (404). Reservas atuais: outro "lite" e um flash.
-const MODELS = (process.env.GEMINI_MODELS || 'gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash')
+const MODELS = (process.env.GEMINI_MODELS || 'gemini-flash-lite-latest,gemini-3.5-flash-lite,gemini-3.1-flash-lite,gemini-3.6-flash')
   .split(/[\s,;]+/).map(m => m.trim()).filter(Boolean);
 const MODEL = MODELS[0];
 const geminiClients = API_KEYS.map(apiKey => new GoogleGenAI({ apiKey }));
@@ -144,7 +144,7 @@ async function generateWithRotation(request) {
       let c = null;
       // "Alta demanda" (503) é do MODELO, não da chave: espera um pouco e tenta de novo
       // na mesma chave (trocar de chave obrigaria a reenviar o vídeo, ~20s cada vez).
-      for (let attempt = 1; attempt <= 3; attempt++) {
+      for (let attempt = 1; attempt <= 2; attempt++) {
         try {
           const contents = await partsForKey(request.contents, ki);
           const response = await geminiClients[ki].models.generateContent({
@@ -159,8 +159,8 @@ async function generateWithRotation(request) {
           lastErr = err;
           if (c.kind === 'other') throw err;
           console.warn(`[Gemini] ⚠️  Chave ${ki + 1} / ${model}: ${c.kind}${c.daily ? ' (limite diário)' : ''} — ${String(err.message || '').slice(0, 160)}`);
-          if (c.kind !== 'overloaded' || attempt === 3) break;
-          await new Promise(r => setTimeout(r, attempt * 3000));
+          if (c.kind !== 'overloaded' || attempt === 2) break;
+          await new Promise(r => setTimeout(r, 1500));
         }
       }
       if (c.kind !== 'quota') onlyQuota = false;
@@ -965,6 +965,8 @@ app.post('/api/recipe/info', async (req, res) => {
   }
 });
 
+const inflightUrls = new Map(); // links sendo processados agora
+
 app.post('/api/recipe/url', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: "URL é obrigatória.", errorCode: 'INVALID_INPUT' });
@@ -994,6 +996,20 @@ app.post('/api/recipe/url', async (req, res) => {
   if (cached) {
     return res.json(cached);
   }
+
+  // Pedido repetido do mesmo link (ex.: o celular perdeu a conexao e tentou de novo):
+  // espera o pedido que ja esta rodando em vez de comecar tudo de novo.
+  if (inflightUrls.has(url)) {
+    const limite = Date.now() + 280000;
+    while (Date.now() < limite && inflightUrls.has(url)) {
+      await new Promise(r => setTimeout(r, 2000));
+      const pronto = getCachedRecipe(url);
+      if (pronto) return res.json(pronto);
+    }
+    const pronto = getCachedRecipe(url);
+    if (pronto) return res.json(pronto);
+  }
+  inflightUrls.set(url, Date.now());
 
   try {
     const startTime = Date.now();
@@ -1293,6 +1309,8 @@ ${JSON.stringify(recipeData.modo_preparo)}` }] }],
       errorCode,
       details: error.message
     });
+  } finally {
+    inflightUrls.delete(url);
   }
 });
 

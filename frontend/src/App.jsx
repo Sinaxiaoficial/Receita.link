@@ -97,10 +97,23 @@ function App() {
         .catch(() => {});
 
       // Gera a receita
-      const response = await axios.post(`${apiUrl}/api/recipe/url`, { url }, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 290000, // 290s — margem de 10s antes do limite de 300s do Vercel Pro
-      });
+      // Se a conexao do celular cair no meio, tenta de novo: o servidor junta com o pedido
+      // que ja esta rodando (nao comeca do zero) e entrega a receita quando ficar pronta.
+      let response;
+      for (let tentativa = 1; ; tentativa++) {
+        try {
+          response = await axios.post(`${apiUrl}/api/recipe/url`, { url }, {
+            headers: { 'Content-Type': 'application/json' },
+            timeout: 790000,
+          });
+          break;
+        } catch (e) {
+          const status = e.response?.status;
+          const caiu = (!e.response && e.code !== 'ECONNABORTED' && !/timeout/i.test(e.message || '')) || status === 502 || status === 504;
+          if (!caiu || tentativa >= 5) throw e;
+          await new Promise(r => setTimeout(r, 3000));
+        }
+      }
       finished = true;
       setRecipe(response.data);
     } catch (err) {
