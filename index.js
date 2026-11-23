@@ -56,6 +56,11 @@ const RECIPE_SCHEMA = {
   type: Type.OBJECT,
   properties: {
     erro: { type: Type.STRING, description: "Preencha apenas se não houver receita no conteúdo. Deixe vazio ou omita se for sucesso." },
+    falas_ingredientes: {
+      type: Type.ARRAY,
+      items: { type: Type.STRING },
+      description: "Copie, palavra por palavra, cada frase falada (ou escrita na tela) que cite um ingrediente ou uma quantidade, na ordem do vídeo. Ex: 'quatro ovos', 'meia xícara de óleo', 'meia colher de sal, colher de sopa', 'tem quatrocentos gramas de polvilho'. Use estas frases para preencher os ingredientes com quantidade."
+    },
     titulo: { type: Type.STRING },
     rendimento: { type: Type.STRING },
     calorias_totais: { type: Type.STRING },
@@ -95,7 +100,10 @@ const RECIPE_SCHEMA = {
   // A IA escreve o modo de preparo ANTES da lista de ingredientes. Assim ela monta a
   // lista já tendo escrito cada passo (com as quantidades ditas no vídeo) e não esquece
   // ingrediente nem quantidade. A tela mostra igual, a ordem do JSON não muda nada lá.
-  propertyOrdering: ['erro', 'titulo', 'rendimento', 'modo_preparo', 'ingredientes', 'calorias_totais']
+  // As "falas" vêm primeiro: a IA anota o que foi dito sobre cada ingrediente e quantidade
+  // e só depois escreve o modo de preparo e a lista. Tudo no MESMO pedido (a chave do
+  // Gemini tem limite de pedidos por dia, então não dá para gastar pedidos extras).
+  propertyOrdering: ['erro', 'titulo', 'rendimento', 'falas_ingredientes', 'modo_preparo', 'ingredientes', 'calorias_totais']
 };
 
 const INGREDIENTS_SCHEMA = {
@@ -103,7 +111,8 @@ const INGREDIENTS_SCHEMA = {
   properties: {
     ingredientes: RECIPE_SCHEMA.properties.ingredientes,
     calorias_totais: { type: Type.STRING }
-  }
+  },
+  propertyOrdering: ['ingredientes', 'calorias_totais']
 };
 
 // Vídeo a partir deste tamanho (em segundos) é "longo": a tela avisa que pode demorar mais.
@@ -142,6 +151,7 @@ function withKcal(v) {
 
 function normalizeRecipe(recipe) {
   if (!recipe) return recipe;
+  delete recipe.falas_ingredientes; // só serve para a IA; a tela não usa
   if (recipe.calorias_totais) recipe.calorias_totais = withKcal(recipe.calorias_totais);
   for (const sec of recipe.ingredientes || []) {
     for (const it of (sec && sec.itens) || []) if (it.kcal) it.kcal = withKcal(it.kcal);
@@ -166,7 +176,11 @@ async function callGeminiWithRetry(requestFn, maxRetries = 3) {
       const isRetryable = [503, 429, 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(status)
         || (err.message && (err.message.includes('503') || err.message.includes('429') || err.message.includes('high demand') || err.message.includes('overloaded')));
 
-      if (isRetryable && attempt < maxRetries) {
+      // Limite DIÁRIO da chave (plano gratuito): tentar de novo não adianta.
+      const isDailyQuota = /PerDay|per day|por dia|free_tier/i.test(err?.message || '');
+      if (isDailyQuota) err.isDailyQuota = true;
+
+      if (isRetryable && !isDailyQuota && attempt < maxRetries) {
         const delay = Math.pow(2, attempt) * 1000;
         console.warn(`[Gemini] ⚠️  Tentativa ${attempt}/${maxRetries} falhou (${status || err.message}). Retentando em ${delay/1000}s...`);
         await new Promise(r => setTimeout(r, delay));
@@ -284,7 +298,6 @@ async function transcribeSpeech(mediaPart) {
   }));
   const text = (response.text || '').trim();
   console.log(`[Transcrição] 📝 ${text.length} caracteres em ${((Date.now() - t0) / 1000).toFixed(1)}s`);
-  console.log(`[Transcrição] início: ${text.slice(0, 1500).replace(/\s+/g, ' ')}`);
   return text;
 }
 
@@ -925,7 +938,7 @@ app.post('/api/recipe/url', async (req, res) => {
     const isLongVideo = videoSeconds ? videoSeconds >= LONG_VIDEO_SECONDS : mediaSizeMB > 30;
     if (videoSeconds) console.log(`[Video] 🎬 Duração: ${Math.round(videoSeconds)}s${isLongVideo ? ' (vídeo longo)' : ''}`);
 
-    const promptText = `Extraia a receita deste conteúdo. Ingredientes e modo de preparo devem vir SOMENTE do que é dito, mostrado ou escrito na legenda. Em cada ingrediente, coloque a quantidade sempre que ela for dita ou mostrada em qualquer momento do vídeo (ex: "4 ovos", "1/2 xícara de óleo", "450 g de polvilho doce") — não deixe só o nome se a quantidade foi dita. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}`;
+    const promptText = `Extraia a receita deste conteúdo. Ingredientes e modo de preparo devem vir SOMENTE do que é dito, mostrado ou escrito na legenda. Em cada ingrediente, coloque a quantidade sempre que ela for dita ou mostrada em qualquer momento do vídeo (ex: "4 ovos", "1/2 xícara de óleo", "450 g de polvilho doce") — não deixe só o nome se a quantidade foi dita. Antes, anote em "falas_ingredientes" as frases do vídeo que citam ingredientes e quantidades, e use-as para montar a lista. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}`;
 
     let contentParts;
 
@@ -944,11 +957,7 @@ app.post('/api/recipe/url', async (req, res) => {
       ];
     }
 
-    // Vídeo longo: a transcrição da fala começa JUNTO com a receita (não atrasa nada).
-    // Ela só é usada se a lista de ingredientes vier sem quantidades.
-    let transcriptPromise = isLongVideo
-      ? transcribeSpeech(contentParts[0]).catch(err => { console.warn(`[Transcrição] ⚠️  ${err.message}`); return ''; })
-      : null;
+    let transcriptPromise = null;
 
     const response = await callGeminiWithRetry(() => ai.models.generateContent({
       model: MODEL,
@@ -1008,10 +1017,15 @@ app.post('/api/recipe/url', async (req, res) => {
       console.warn(`[Gemini] ⚠️  Ingredientes: ${qty.total} itens, ${qty.missing} sem quantidade — refazendo a lista pela transcrição`);
       const fixStart = Date.now();
       try {
-        const transcript = await (transcriptPromise || transcribeSpeech(contentParts[0]).catch(() => ''));
+        // Fonte do reparo: as frases que a própria IA anotou (texto, pedido leve). Se ela
+        // não anotou nada, transcreve a fala do vídeo.
+        const falas = (recipeData.falas_ingredientes || []).filter(Boolean);
+        const transcript = falas.length >= 2
+          ? falas.join('\n')
+          : await (transcriptPromise || transcribeSpeech(contentParts[0]).catch(() => ''));
         // Sem transcrição (falhou): a IA olha o vídeo de novo, só atrás dos ingredientes.
         const source = transcript
-          ? `--- TRANSCRIÇÃO DA FALA DO VÍDEO ---\n${transcript}`
+          ? `--- FALAS DO VÍDEO (transcrição) ---\n${transcript}`
           : '--- A FONTE É O VÍDEO ACIMA: assista e ouça ele INTEIRO ---';
         const ingResponse = await callGeminiWithRetry(() => ai.models.generateContent({
           model: MODEL,
@@ -1075,7 +1089,11 @@ ${JSON.stringify(recipeData.modo_preparo)}` }] }],
     let errorCode = 'INTERNAL_ERROR';
     const msg = error.message || '';
 
-    if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNABORTED')) {
+    if (error.isDailyQuota || /PerDay|per day|por dia|free_tier/i.test(msg)) {
+      userError = 'O limite diário de uso da IA foi atingido. Tente novamente mais tarde.';
+      errorCode = 'AI_DAILY_LIMIT';
+      console.error('[Gemini] ❌ LIMITE DIÁRIO DA CHAVE ATINGIDO (plano gratuito do Gemini)');
+    } else if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNABORTED')) {
       userError = 'O processamento excedeu o tempo limite. Vídeos muito longos podem não ser suportados. Tente com um vídeo mais curto ou tente novamente.';
       errorCode = 'TIMEOUT';
     } else if (msg.includes('Unterminated string') || msg.includes('JSON') || msg.includes('Unexpected token')) {
