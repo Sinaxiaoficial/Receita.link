@@ -2,7 +2,7 @@ require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const multer = require('multer');
-const { GoogleGenAI, Type, MediaResolution } = require('@google/genai');
+const { GoogleGenAI, Type, MediaResolution, ThinkingLevel } = require('@google/genai');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -28,13 +28,124 @@ app.use(cors());
 app.use(express.json());
 const upload = multer({ dest: '/tmp/' });
 
-const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
+// ========================================================================
+// Chaves do Gemini com rodízio
+// ========================================================================
+// As chaves ficam SÓ nas variáveis de ambiente da Vercel, nunca no código:
+//   GEMINI_API_KEYS = chave1,chave2,chave3   (várias, separadas por vírgula)
+//   GEMINI_API_KEY  = chave                  (a antiga; entra no fim da lista)
+// Quando uma chave atinge o limite (cota), o pedido vai na hora para a próxima.
+// GEMINI_MODELS (opcional) = modelos em ordem de preferência, do mais leve ao reserva.
+
+const API_KEYS = [...new Set(
+  [process.env.GEMINI_API_KEYS, process.env.GEMINI_API_KEY]
+    .filter(Boolean).join(',')
+    .split(/[\s,;]+/).map(k => k.trim()).filter(Boolean)
+)];
+const MODELS = (process.env.GEMINI_MODELS || 'gemini-3.5-flash-lite,gemini-2.5-flash-lite')
+  .split(/[\s,;]+/).map(m => m.trim()).filter(Boolean);
+const MODEL = MODELS[0];
+const geminiClients = API_KEYS.map(apiKey => new GoogleGenAI({ apiKey }));
+console.log(`[Gemini] ${geminiClients.length} chave(s) configurada(s); modelos: ${MODELS.join(' → ')}`);
+
+const blockedUntil = new Map(); // "índice da chave#modelo" → até quando está bloqueada
+let currentKey = 0;             // continua na chave que funcionou por último
+
+// Vídeos enviados pela File API pertencem à chave que enviou. Se o pedido trocar de
+// chave, o vídeo é enviado de novo com a chave nova (guardamos o vídeo para isso).
+const uploadedMedia = new Map(); // uri → { buffer, mimeType, type, byKey: Map(índice → Promise<uri>) }
+
+function classifyGeminiError(err) {
+  const msg = String(err?.message || err || '');
+  const status = err?.status || err?.code;
+  const retry = msg.match(/"retryDelay"\s*:\s*"(\d+(?:\.\d+)?)s"/);
+  const retryMs = retry ? Math.ceil(Number(retry[1]) * 1000) : 0;
+  if (status === 429 || /RESOURCE_EXHAUSTED|\b429\b|quota|cota/i.test(msg)) {
+    const daily = /PerDay|per day|por dia/i.test(msg);
+    return { kind: 'quota', daily, blockMs: retryMs || (daily ? 6 * 3600e3 : 60e3) };
+  }
+  if ([401, 403].includes(status) || /API_KEY_INVALID|API key not valid|PERMISSION_DENIED|API_KEY_SERVICE_BLOCKED|billing/i.test(msg)) {
+    return { kind: 'key', blockMs: 3600e3 };
+  }
+  if (status === 503 || /UNAVAILABLE|\b503\b|overloaded|high demand|alta demanda/i.test(msg)) {
+    return { kind: 'overloaded', blockMs: 0 };
+  }
+  if (status === 404 || /not found|is not supported|não é compatível/i.test(msg)) {
+    return { kind: 'model', blockMs: 3600e3 };
+  }
+  return { kind: 'other', blockMs: 0 };
+}
+
+// Modelos Gemini 3 não aceitam thinkingBudget: 0 — usam "nível de raciocínio".
+function adaptConfigForModel(config, model) {
+  if (!config || !config.thinkingConfig || !/gemini-3|-latest$/.test(model)) return config;
+  const budget = config.thinkingConfig.thinkingBudget;
+  if (budget === undefined) return config;
+  const L = ThinkingLevel || { MINIMAL: 'MINIMAL', LOW: 'LOW', MEDIUM: 'MEDIUM' };
+  const thinkingLevel = budget === 0 ? L.MINIMAL : budget <= 1024 ? L.LOW : L.MEDIUM;
+  return { ...config, thinkingConfig: { thinkingLevel } };
+}
+
+async function partsForKey(contents, ki) {
+  return Promise.all(contents.map(async c => ({
+    ...c,
+    parts: await Promise.all((c.parts || []).map(async part => {
+      const uri = part.fileData && part.fileData.fileUri;
+      const media = uri && uploadedMedia.get(uri);
+      if (!media) return part;
+      if (!media.byKey.has(ki)) {
+        console.log(`[Gemini] ⬆️  Enviando o vídeo de novo para a chave ${ki + 1}`);
+        media.byKey.set(ki, uploadFileWithClient(geminiClients[ki], media.buffer, media.mimeType, media.type).then(r => r.uri));
+      }
+      return { fileData: { fileUri: await media.byKey.get(ki), mimeType: part.fileData.mimeType } };
+    }))
+  })));
+}
+
+/**
+ * Faz o pedido ao Gemini tentando cada chave (e depois cada modelo reserva).
+ * Limite/cota ou chave inválida → bloqueia aquela chave por um tempo e passa à próxima.
+ */
+async function generateWithRotation(request) {
+  if (geminiClients.length === 0) throw new Error('Nenhuma chave do Gemini configurada (GEMINI_API_KEYS)');
+  let lastErr = null;
+  let onlyQuota = true;
+  for (const model of MODELS) {
+    for (let n = 0; n < geminiClients.length; n++) {
+      const ki = (currentKey + n) % geminiClients.length;
+      const slot = `${ki}#${model}`;
+      if ((blockedUntil.get(slot) || 0) > Date.now()) continue;
+      try {
+        const contents = await partsForKey(request.contents, ki);
+        const response = await geminiClients[ki].models.generateContent({
+          ...request, model, contents, config: adaptConfigForModel(request.config, model)
+        });
+        if (ki !== currentKey) console.log(`[Gemini] 🔁 Agora usando a chave ${ki + 1}`);
+        currentKey = ki;
+        return response;
+      } catch (err) {
+        const c = classifyGeminiError(err);
+        if (c.kind === 'other') throw err;
+        if (c.kind !== 'quota') onlyQuota = false;
+        if (c.blockMs) blockedUntil.set(slot, Date.now() + c.blockMs);
+        console.warn(`[Gemini] ⚠️  Chave ${ki + 1} / ${model}: ${c.kind}${c.daily ? ' (limite diário)' : ''} — tentando a próxima`);
+        lastErr = err;
+        if (c.kind === 'model') break; // modelo indisponível: vai direto ao próximo modelo
+      }
+    }
+  }
+  const err = lastErr || new Error('Todas as chaves do Gemini estão no limite agora');
+  err.allKeysBlocked = true;
+  if (onlyQuota) err.isDailyQuota = true;
+  throw err;
+}
+
+// Mesma "cara" do cliente do SDK, para o resto do código não mudar.
+const ai = { models: { generateContent: generateWithRotation } };
 
 // ========================================================================
 // Configuração Otimizada
 // ========================================================================
-
-const MODEL = 'gemini-2.5-flash';
 
 const SYSTEM_INSTRUCTION = `Você é um extrator rápido e preciso de receitas de vídeos culinários.
 
@@ -176,11 +287,10 @@ async function callGeminiWithRetry(requestFn, maxRetries = 3) {
       const isRetryable = [503, 429, 'UNAVAILABLE', 'RESOURCE_EXHAUSTED'].includes(status)
         || (err.message && (err.message.includes('503') || err.message.includes('429') || err.message.includes('high demand') || err.message.includes('overloaded')));
 
-      // Limite DIÁRIO da chave (plano gratuito): tentar de novo não adianta.
-      const isDailyQuota = /PerDay|per day|por dia|free_tier/i.test(err?.message || '');
-      if (isDailyQuota) err.isDailyQuota = true;
+      // Todas as chaves no limite: esperar alguns segundos não resolve.
+      if (err.isDailyQuota) throw err;
 
-      if (isRetryable && !isDailyQuota && attempt < maxRetries) {
+      if (isRetryable && attempt < maxRetries) {
         const delay = Math.pow(2, attempt) * 1000;
         console.warn(`[Gemini] ⚠️  Tentativa ${attempt}/${maxRetries} falhou (${status || err.message}). Retentando em ${delay/1000}s...`);
         await new Promise(r => setTimeout(r, delay));
@@ -234,6 +344,15 @@ function setCachedRecipe(url, data) {
  * Muito mais eficiente que inline base64 para vídeos (binário vs base64 = 33% menos dados).
  */
 async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
+  // Envia com a chave atual; se depois o pedido trocar de chave, partsForKey reenvia.
+  const ki = currentKey;
+  const ref = await uploadFileWithClient(geminiClients[ki], rawBuffer, mimeType, type);
+  uploadedMedia.set(ref.uri, { buffer: rawBuffer, mimeType, type, byKey: new Map([[ki, Promise.resolve(ref.uri)]]) });
+  if (uploadedMedia.size > 20) uploadedMedia.delete(uploadedMedia.keys().next().value);
+  return ref;
+}
+
+async function uploadFileWithClient(client, rawBuffer, mimeType, type) {
   const ext = type === 'audio' ? 'mp3' : 'mp4';
   const tmpPath = path.join('/tmp', `gemini_upload_${Date.now()}.${ext}`);
 
@@ -244,7 +363,7 @@ async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
     console.log(`[File API] ⬆️  Uploading ${sizeMB}MB ${type} to Gemini...`);
 
     const uploadStart = Date.now();
-    const uploadResult = await ai.files.upload({
+    const uploadResult = await client.files.upload({
       file: tmpPath,
       config: { mimeType, displayName: `tiktok_${type}_${Date.now()}` }
     });
@@ -260,7 +379,7 @@ async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
     while (file.state === 'PROCESSING') {
       if (Date.now() - waitStart > 120000) throw new Error('File API: timeout aguardando processamento');
       await new Promise(r => setTimeout(r, 1000));
-      file = await ai.files.get({ name: file.name });
+      file = await client.files.get({ name: file.name });
     }
     console.log(`[File API] ✅ Arquivo pronto (${((Date.now() - waitStart) / 1000).toFixed(1)}s de processamento)`);
 
@@ -1089,10 +1208,10 @@ ${JSON.stringify(recipeData.modo_preparo)}` }] }],
     let errorCode = 'INTERNAL_ERROR';
     const msg = error.message || '';
 
-    if (error.isDailyQuota || /PerDay|per day|por dia|free_tier/i.test(msg)) {
-      userError = 'O limite diário de uso da IA foi atingido. Tente novamente mais tarde.';
+    if (error.isDailyQuota) {
+      userError = 'O limite de uso da IA foi atingido. Tente novamente mais tarde.';
       errorCode = 'AI_DAILY_LIMIT';
-      console.error('[Gemini] ❌ LIMITE DIÁRIO DA CHAVE ATINGIDO (plano gratuito do Gemini)');
+      console.error('[Gemini] ❌ TODAS AS CHAVES NO LIMITE — adicione mais chaves em GEMINI_API_KEYS');
     } else if (msg.includes('timeout') || msg.includes('ETIMEDOUT') || msg.includes('ECONNABORTED')) {
       userError = 'O processamento excedeu o tempo limite. Vídeos muito longos podem não ser suportados. Tente com um vídeo mais curto ou tente novamente.';
       errorCode = 'TIMEOUT';
