@@ -83,28 +83,23 @@ function App() {
     setError('');
     setRecipe(null);
     setVideoInfo(null);
+    let finished = false;
 
     try {
       const apiUrl = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:3001');
 
-      // 1. Pergunta rápida: duração do vídeo (para o aviso de vídeo longo).
-      //    Se falhar ou demorar, segue normalmente sem o aviso.
-      try {
-        const infoRes = await axios.post(`${apiUrl}/api/recipe/info`, { url }, { timeout: 8000 });
-        if (infoRes.data?.cached && infoRes.data.recipe) {
-          setRecipe(infoRes.data.recipe);
-          return;
-        }
-        setVideoInfo(infoRes.data);
-      } catch (infoErr) {
-        // sem problema
-      }
+      // Pergunta a duração do vídeo AO MESMO TEMPO que pede a receita (não atrasa nada).
+      // Serve só para o aviso de vídeo longo e a contagem; se falhar, tudo segue normal.
+      axios.post(`${apiUrl}/api/recipe/info`, { url }, { timeout: 15000 })
+        .then(infoRes => { if (!finished && infoRes.data && !infoRes.data.cached) setVideoInfo(infoRes.data); })
+        .catch(() => {});
 
-      // 2. Gera a receita
+      // Gera a receita
       const response = await axios.post(`${apiUrl}/api/recipe/url`, { url }, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 290000, // 290s — margem de 10s antes do limite de 300s do Vercel Pro
       });
+      finished = true;
       setRecipe(response.data);
     } catch (err) {
       console.error(err);
@@ -123,16 +118,21 @@ function App() {
 
       setError(errorMessage);
     } finally {
+      finished = true;
       setLoading(false);
       setVideoInfo(null);
     }
   };
 
   // Dados da contagem na tela de espera
-  const estimate = estimateSeconds(videoInfo);
+  const knownLong = !!videoInfo && (videoInfo.longVideo || (videoInfo.duration || 0) >= LONG_VIDEO_SECONDS);
+  // Sem a duração (o serviço que informa falhou) e já passou de 40s: provavelmente é um
+  // vídeo grande. Mostra o aviso e uma estimativa maior, em vez de "quase pronto" parado.
+  const guessedLong = !videoInfo?.duration && elapsed > 40;
+  const isLongVideo = knownLong || guessedLong;
+  const estimate = guessedLong ? Math.max(150, estimateSeconds(videoInfo)) : estimateSeconds(videoInfo);
   const remaining = estimate - elapsed;
   const progress = Math.min(95, (elapsed / estimate) * 100);
-  const isLongVideo = !!videoInfo && (videoInfo.longVideo || (videoInfo.duration || 0) >= LONG_VIDEO_SECONDS);
   const stageText = progress < 25
     ? 'Baixando o vídeo do TikTok...'
     : progress < 75
@@ -295,8 +295,10 @@ function App() {
 
                 {isLongVideo && (
                   <div className="max-w-md mx-auto px-5 py-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-sm font-medium">
-                    Este vídeo é grande ({Math.round(videoInfo.duration / 60)} min), por isso pode demorar um pouco mais
-                    — cerca de {formatSeconds(estimate)}. Deixe esta página aberta. ⏳
+                    {knownLong
+                      ? `Este vídeo é grande (${Math.round(videoInfo.duration / 60)} min), por isso pode demorar um pouco mais — cerca de ${formatSeconds(estimate)} no total.`
+                      : 'Este vídeo parece ser grande, por isso pode demorar um pouco mais.'}
+                    {' '}Deixe esta página aberta. ⏳
                   </div>
                 )}
 
@@ -316,7 +318,7 @@ function App() {
                   </p>
                 </div>
 
-                {!isLongVideo && !videoInfo && (
+                {!isLongVideo && !videoInfo?.duration && (
                   <p className="text-sm text-slate-500 max-w-sm mx-auto">Vídeos curtos levam ~15s. Vídeos maiores podem levar alguns minutos. ⚡</p>
                 )}
               </div>

@@ -105,6 +105,21 @@ const INGREDIENTS_SCHEMA = {
 // Vídeo a partir deste tamanho (em segundos) é "longo": a tela avisa que pode demorar mais.
 const LONG_VIDEO_SECONDS = 600;
 
+// Lê a duração (em segundos) direto do arquivo MP4 (caixa "mvhd").
+// Usado quando o vídeo veio de um provedor que não informa a duração.
+function mp4DurationSeconds(buffer) {
+  try {
+    const i = buffer.indexOf('mvhd');
+    if (i < 0) return 0;
+    const version = buffer[i + 4];
+    const timescale = version === 1 ? buffer.readUInt32BE(i + 24) : buffer.readUInt32BE(i + 16);
+    const duration = version === 1 ? Number(buffer.readBigUInt64BE(i + 28)) : buffer.readUInt32BE(i + 20);
+    return timescale ? duration / timescale : 0;
+  } catch (e) {
+    return 0;
+  }
+}
+
 function countIngredients(recipe) {
   return (recipe?.ingredientes || []).reduce((n, sec) => n + ((sec && sec.itens) ? sec.itens.length : 0), 0);
 }
@@ -291,17 +306,20 @@ async function fetchTikWMMeta(url) {
 const metaCache = new Map();
 const META_TTL_MS = 2 * 60 * 1000;
 
+// Guarda a PROMESSA: se a tela pedir a duração (/info) e a receita (/url) ao mesmo
+// tempo, as duas usam a mesma consulta ao TikWM (ele só aceita ~1 pedido por segundo).
 async function getTikWMMeta(url) {
   const key = getCacheKey(url);
   const entry = metaCache.get(key);
   if (entry && Date.now() - entry.timestamp < META_TTL_MS) {
     console.log('[TikWM] ✅ Dados do vídeo reaproveitados');
-    return entry.meta;
+    return entry.promise;
   }
-  const meta = await fetchTikWMMeta(url);
+  const promise = fetchTikWMMeta(url);
   if (metaCache.size > 200) metaCache.delete(metaCache.keys().next().value);
-  metaCache.set(key, { meta, timestamp: Date.now() });
-  return meta;
+  metaCache.set(key, { promise, timestamp: Date.now() });
+  promise.catch(() => metaCache.delete(key)); // falhou: não guarda
+  return promise;
 }
 
 // Tempo limite do download proporcional ao tamanho: vídeos longos têm 50MB+ e
@@ -738,20 +756,35 @@ app.post('/api/recipe/url', async (req, res) => {
 
     // 1. Dados do vídeo (link + legenda) primeiro; o download do vídeo começa
     //    logo em seguida e corre em paralelo com a leitura da legenda.
-    let meta = null;
-    try {
-      meta = await getTikWMMeta(url);
-      if (meta.duration) console.log(`[TikWM] 🎬 Vídeo de ${Math.round(meta.duration / 60)} min (${(meta.size / (1024 * 1024)).toFixed(1)}MB)`);
-    } catch (metaErr) {
+    //    O TikWM às vezes fica sem responder (vimos 10s de espera à toa na Vercel).
+    //    Ele ganha 4s de vantagem; se não responder, os outros provedores começam juntos
+    //    e vence quem entregar o vídeo primeiro.
+    const metaPromise = getTikWMMeta(url).catch(metaErr => {
       console.warn(`[TikWM] ⚠️  ${metaErr.message} — usando provedores alternativos`);
-    }
+      return null;
+    });
+    let meta = await Promise.race([metaPromise, new Promise(r => setTimeout(() => r(undefined), 4000))]);
+    if (meta && meta.duration) console.log(`[TikWM] 🎬 Vídeo de ${Math.round(meta.duration / 60)} min (${(meta.size / (1024 * 1024)).toFixed(1)}MB)`);
 
-    const mediaPromise = meta
-      ? downloadTikWMVideo(meta).catch(err => {
-          console.warn(`[Video] ⚠️  Download pelo TikWM falhou (${err.message}) — usando provedores alternativos`);
-          return downloadWithFallbacks(url);
+    let mediaPromise;
+    if (meta) {
+      mediaPromise = downloadTikWMVideo(meta).catch(err => {
+        console.warn(`[Video] ⚠️  Download pelo TikWM falhou (${err.message}) — usando provedores alternativos`);
+        return downloadWithFallbacks(url);
+      });
+    } else if (meta === null) {
+      mediaPromise = downloadWithFallbacks(url);
+    } else {
+      console.warn('[TikWM] ⏳ Lento — provedores alternativos começam em paralelo');
+      meta = null;
+      mediaPromise = Promise.any([
+        downloadWithFallbacks(url),
+        metaPromise.then(m => {
+          if (!m) throw new Error('TikWM sem dados');
+          return downloadTikWMVideo(m);
         })
-      : downloadWithFallbacks(url);
+      ]).catch(e => { throw (e.errors && e.errors[0]) || e; });
+    }
     // Evita "unhandled rejection" quando a legenda resolve e o vídeo nunca é aguardado
     mediaPromise.catch(() => {});
 
@@ -811,19 +844,24 @@ app.post('/api/recipe/url', async (req, res) => {
     // tem limite de 20MB e o base64 aumenta o arquivo em ~33% → até 14MB cabe.
     const USE_FILE_API_THRESHOLD_MB = 14;
 
+    // Duração do vídeo: pelo TikWM ou lida do próprio arquivo MP4.
+    const videoSeconds = mediaData.duration || mp4DurationSeconds(mediaData.buffer);
+    const isLongVideo = videoSeconds ? videoSeconds >= LONG_VIDEO_SECONDS : mediaSizeMB > 30;
+    if (videoSeconds) console.log(`[Video] 🎬 Duração: ${Math.round(videoSeconds)}s${isLongVideo ? ' (vídeo longo)' : ''}`);
+
+    const promptText = `Extraia a receita deste conteúdo. Ingredientes e modo de preparo devem vir SOMENTE do que é dito, mostrado ou escrito na legenda. Em cada ingrediente, coloque a quantidade sempre que ela for dita ou mostrada em qualquer momento do vídeo (ex: "4 ovos", "1/2 xícara de óleo", "450 g de polvilho doce") — não deixe só o nome se a quantidade foi dita. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}`;
+
     let contentParts;
 
     if (mediaSizeMB > USE_FILE_API_THRESHOLD_MB) {
       console.log(`[Gemini] Arquivo grande (${mediaSizeMB.toFixed(1)}MB) — usando File API`);
       const fileRef = await uploadToGeminiFileAPI(mediaData.buffer, mediaData.mimeType, mediaData.type);
-      const promptText = `Extraia a receita deste conteúdo. Ingredientes e modo de preparo devem vir SOMENTE do que é dito, mostrado ou escrito na legenda. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}`;
       contentParts = [
         { fileData: { fileUri: fileRef.uri, mimeType: fileRef.mimeType } },
         { text: promptText }
       ];
     } else {
       console.log(`[Gemini] Arquivo pequeno (${mediaSizeMB.toFixed(1)}MB) — usando inline`);
-      const promptText = `Extraia a receita deste conteúdo. Ingredientes e modo de preparo devem vir SOMENTE do que é dito, mostrado ou escrito na legenda. Para calorias (kcal), estime os valores nutricionais de cada ingrediente.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}`;
       contentParts = [
         { inlineData: { data: mediaData.buffer.toString('base64'), mimeType: mediaData.mimeType } },
         { text: promptText }
@@ -839,7 +877,9 @@ app.post('/api/recipe/url', async (req, res) => {
         responseSchema: RECIPE_SCHEMA,
         // Resolução baixa: ~4x menos dados por quadro → IA responde mais rápido. O áudio não muda.
         mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
-        thinkingConfig: { thinkingBudget: 0 },
+        // Vídeo longo: um pouco de raciocínio para não perder ingredientes e quantidades
+        // ditos ao longo de 10+ minutos. Vídeo curto continua sem (mais rápido).
+        thinkingConfig: { thinkingBudget: isLongVideo ? 1024 : 0 },
         temperature: 0,
         // Receitas de vídeos longos são maiores; 4000 cortava a resposta no meio.
         // O limite maior não deixa as receitas curtas mais lentas.
