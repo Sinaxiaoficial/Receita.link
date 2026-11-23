@@ -305,6 +305,10 @@ function normalizeRecipe(recipe) {
   return recipe;
 }
 
+function hasSteps(recipe) {
+  return Array.isArray(recipe?.modo_preparo) && recipe.modo_preparo.some(sec => sec && Array.isArray(sec.passos) && sec.passos.length > 0);
+}
+
 function countIngredients(recipe) {
   return (recipe?.ingredientes || []).reduce((n, sec) => n + ((sec && sec.itens) ? sec.itens.length : 0), 0);
 }
@@ -1113,7 +1117,7 @@ app.post('/api/recipe/url', async (req, res) => {
 
     let transcriptPromise = null;
 
-    const response = await callGeminiWithRetry(() => ai.models.generateContent({
+    const askRecipe = () => callGeminiWithRetry(() => ai.models.generateContent({
       model: MODEL,
       contents: [{ role: 'user', parts: contentParts }],
       config: {
@@ -1132,11 +1136,31 @@ app.post('/api/recipe/url', async (req, res) => {
       }
     }));
 
-    let textResponse = response.text;
+    // A IA do plano gratuito às vezes devolve uma resposta incompleta (sem título,
+    // ingredientes ou passos). Nesse caso pede de novo UMA vez antes de desistir.
+    let recipeData = null;
+    for (let tentativa = 1; tentativa <= 2; tentativa++) {
+      const response = await askRecipe();
+      const raw = String(response.text || '');
+      try {
+        recipeData = JSON.parse(raw.replace(/^\s*```(?:json)?\s*|\s*```\s*$/g, ''));
+      } catch (parseErr) {
+        recipeData = null;
+      }
+      const ok = recipeData && !(recipeData.erro && !hasSteps(recipeData))
+        && Array.isArray(recipeData.modo_preparo) && hasSteps(recipeData);
+      if (ok || (recipeData && recipeData.erro && !hasSteps(recipeData))) break;
+      console.warn(`[Gemini] ⚠️  Resposta incompleta (tentativa ${tentativa}/2): fim=${response.candidates?.[0]?.finishReason} campos=${recipeData ? Object.keys(recipeData).join(',') : 'JSON inválido'} início=${raw.slice(0, 200).replace(/\s+/g, ' ')}`);
+      if (Date.now() - startTime > 200000) break;
+    }
+    if (!recipeData) throw new Error('JSON inválido na resposta da IA');
+    // "erro" preenchido junto com uma receita completa (ex: "nenhum") não é erro de verdade.
+    if (recipeData.erro && hasSteps(recipeData)) delete recipeData.erro;
+    if (!recipeData.titulo && hasSteps(recipeData)) recipeData.titulo = (mediaData.title || 'Receita').replace(/#\S+/g, '').trim() || 'Receita';
+    if (!Array.isArray(recipeData.ingredientes)) recipeData.ingredientes = [];
+
     const geminiElapsed = ((Date.now() - geminiStart) / 1000).toFixed(1);
     console.log(`[Gemini] ✅ Resposta em ${geminiElapsed}s`);
-
-    const recipeData = JSON.parse(textResponse);
 
     // Verificar se o Gemini indicou que não encontrou receita
     if (recipeData.erro) {
