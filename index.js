@@ -91,7 +91,11 @@ const RECIPE_SCHEMA = {
         }
       }
     }
-  }
+  },
+  // A IA escreve o modo de preparo ANTES da lista de ingredientes. Assim ela monta a
+  // lista já tendo escrito cada passo (com as quantidades ditas no vídeo) e não esquece
+  // ingrediente nem quantidade. A tela mostra igual, a ordem do JSON não muda nada lá.
+  propertyOrdering: ['erro', 'titulo', 'rendimento', 'modo_preparo', 'ingredientes', 'calorias_totais']
 };
 
 const INGREDIENTS_SCHEMA = {
@@ -118,6 +122,16 @@ function mp4DurationSeconds(buffer) {
   } catch (e) {
     return 0;
   }
+}
+
+// Lista de ingredientes sem NENHUMA quantidade, mas o modo de preparo tem números:
+// sinal de que a IA deixou as quantidades só nos passos.
+function ingredientsMissingQuantities(recipe) {
+  const items = (recipe?.ingredientes || []).flatMap(sec => (sec && sec.itens) || []);
+  if (items.length === 0) return false;
+  const hasQty = items.some(it => /\d|½|¼|¾|meia|meio|uma|um |dois|duas|três|quatro|cinco|xícara|colher|pitada|copo|lata/i.test(it.descricao || ''));
+  const stepsText = JSON.stringify(recipe.modo_preparo || []);
+  return !hasQty && /\d/.test(stepsText);
 }
 
 function countIngredients(recipe) {
@@ -694,6 +708,18 @@ function cleanTikTokUrl(url) {
   return String(url || '').replace(/[,.!?;:]+$/, '').trim();
 }
 
+// Plano B para a duração: a própria página do TikTok traz "duration":<segundos>.
+async function fetchTikTokPageDuration(url) {
+  const response = await axios.get(url, {
+    timeout: 6000,
+    headers: { 'User-Agent': getRandomUserAgent(), 'Accept-Language': 'pt-BR,pt;q=0.9' },
+    responseType: 'text'
+  });
+  const m = String(response.data || '').match(/"duration":(\d+)/);
+  if (!m || !Number(m[1])) throw new Error('duração não encontrada na página');
+  return Number(m[1]);
+}
+
 /**
  * Rota rápida (~1s) que a tela chama antes da principal: diz a duração do vídeo,
  * para avisar quando ele é longo e mostrar uma contagem de tempo adequada.
@@ -706,11 +732,19 @@ app.post('/api/recipe/info', async (req, res) => {
     url = await resolveShortUrl(url);
     const cached = getCachedRecipe(url);
     if (cached) return res.json({ cached: true, recipe: cached });
-    const meta = await getTikWMMeta(url);
+    // TikWM e a página do TikTok ao mesmo tempo; vale a primeira que trouxer a duração.
+    let tikwmMeta = null;
+    const tikwm = getTikWMMeta(url).then(m => (tikwmMeta = m));
+    tikwm.catch(() => {});
+    const duration = await Promise.any([
+      tikwm.then(m => { if (!m.duration) throw new Error('sem duração'); return m.duration; }),
+      fetchTikTokPageDuration(url)
+    ]);
+    const meta = tikwmMeta; // só existe se o TikWM já respondeu
     res.json({
-      duration: meta.duration || null,
-      longVideo: (meta.duration || 0) >= LONG_VIDEO_SECONDS,
-      captionHasRecipe: captionLooksLikeRecipe(meta.description)
+      duration,
+      longVideo: duration >= LONG_VIDEO_SECONDS,
+      captionHasRecipe: meta ? captionLooksLikeRecipe(meta.description) : false
     });
   } catch (err) {
     // Não é grave: a tela só não mostra o aviso de vídeo longo.
@@ -919,8 +953,9 @@ app.post('/api/recipe/url', async (req, res) => {
     // modo de preparo. Pedimos de novo SÓ os ingredientes, do mesmo vídeo, deixando a
     // IA "pensar" um pouco para varrer o vídeo inteiro. Só roda quando faltou.
     const elapsedSoFar = Date.now() - startTime;
-    if (countIngredients(recipeData) === 0 && elapsedSoFar < 200000) {
-      console.warn('[Gemini] ⚠️  Receita veio sem ingredientes — buscando os ingredientes de novo');
+    const noIngredients = countIngredients(recipeData) === 0;
+    if ((noIngredients || ingredientsMissingQuantities(recipeData)) && elapsedSoFar < 200000) {
+      console.warn(`[Gemini] ⚠️  Receita veio ${noIngredients ? 'sem ingredientes' : 'sem quantidades nos ingredientes'} — buscando os ingredientes de novo`);
       const ingStart = Date.now();
       try {
         const ingResponse = await callGeminiWithRetry(() => ai.models.generateContent({
