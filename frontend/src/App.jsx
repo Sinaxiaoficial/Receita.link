@@ -4,6 +4,25 @@ import axios from 'axios';
 import { Download, Copy, Loader2, Utensils, Clock, CheckCircle2, ChevronRight, Link2, FileText, Flame } from 'lucide-react';
 import './index.css';
 
+// Vídeo a partir de 10 minutos é "longo": avisa que pode demorar mais.
+const LONG_VIDEO_SECONDS = 600;
+
+// Tempo estimado (em segundos) para gerar a receita, pela duração do vídeo.
+function estimateSeconds(info) {
+  if (!info) return 30;
+  if (info.captionHasRecipe) return 10;
+  if (!info.duration) return 30;
+  return Math.round(Math.min(240, 15 + info.duration * 0.15));
+}
+
+function formatSeconds(total) {
+  const s = Math.max(0, Math.round(total));
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  const r = s % 60;
+  return r ? `${m} min ${r}s` : `${m} min`;
+}
+
 function App() {
   const [url, setUrl] = useState('');
   const [loading, setLoading] = useState(false);
@@ -20,6 +39,17 @@ function App() {
   });
   const [error, setError] = useState('');
   const [copied, setCopied] = useState(false);
+  const [videoInfo, setVideoInfo] = useState(null); // { duration, longVideo, captionHasRecipe }
+  const [elapsed, setElapsed] = useState(0);
+
+  // Contagem de tempo enquanto a receita é gerada
+  useEffect(() => {
+    if (!loading) return;
+    setElapsed(0);
+    const start = Date.now();
+    const timer = setInterval(() => setElapsed((Date.now() - start) / 1000), 1000);
+    return () => clearInterval(timer);
+  }, [loading]);
 
   // Limpeza única: remove a URL antiga que ficou salva no navegador do usuário
   useEffect(() => {
@@ -52,9 +82,25 @@ function App() {
     setLoading(true);
     setError('');
     setRecipe(null);
+    setVideoInfo(null);
 
     try {
       const apiUrl = import.meta.env.VITE_API_URL || (import.meta.env.PROD ? '' : 'http://localhost:3001');
+
+      // 1. Pergunta rápida: duração do vídeo (para o aviso de vídeo longo).
+      //    Se falhar ou demorar, segue normalmente sem o aviso.
+      try {
+        const infoRes = await axios.post(`${apiUrl}/api/recipe/info`, { url }, { timeout: 4000 });
+        if (infoRes.data?.cached && infoRes.data.recipe) {
+          setRecipe(infoRes.data.recipe);
+          return;
+        }
+        setVideoInfo(infoRes.data);
+      } catch (infoErr) {
+        // sem problema
+      }
+
+      // 2. Gera a receita
       const response = await axios.post(`${apiUrl}/api/recipe/url`, { url }, {
         headers: { 'Content-Type': 'application/json' },
         timeout: 290000, // 290s — margem de 10s antes do limite de 300s do Vercel Pro
@@ -78,8 +124,20 @@ function App() {
       setError(errorMessage);
     } finally {
       setLoading(false);
+      setVideoInfo(null);
     }
   };
+
+  // Dados da contagem na tela de espera
+  const estimate = estimateSeconds(videoInfo);
+  const remaining = estimate - elapsed;
+  const progress = Math.min(95, (elapsed / estimate) * 100);
+  const isLongVideo = !!videoInfo && (videoInfo.longVideo || (videoInfo.duration || 0) >= LONG_VIDEO_SECONDS);
+  const stageText = progress < 25
+    ? 'Baixando o vídeo do TikTok...'
+    : progress < 75
+      ? 'O Chef de IA está assistindo o vídeo e anotando tudo...'
+      : 'Escrevendo a receita...';
 
   const handleCopy = () => {
     if (!recipe) return;
@@ -92,7 +150,7 @@ function App() {
     recipe.ingredientes.forEach(secao => {
       textToCopy += `\n[${secao.secao}]\n`;
       secao.itens.forEach(item => {
-         textToCopy += `- ${item.descricao} (${item.kcal})\n`;
+         textToCopy += `- ${item.descricao}${item.kcal ? ` (${item.kcal})` : ''}\n`;
       });
     });
 
@@ -124,7 +182,7 @@ function App() {
     recipe.ingredientes.forEach(secao => {
       textToCopy += `\n[${secao.secao}]\n`;
       secao.itens.forEach(item => {
-         textToCopy += `- ${item.descricao} (${item.kcal})\n`;
+         textToCopy += `- ${item.descricao}${item.kcal ? ` (${item.kcal})` : ''}\n`;
       });
     });
 
@@ -233,8 +291,34 @@ function App() {
                   <div className="absolute inset-0 rounded-full border-t-2 border-blue-600 animate-spin"></div>
                   <Utensils className="absolute inset-0 m-auto w-6 h-6 text-blue-600 animate-pulse" />
                 </div>
-                <p className="text-slate-600 font-medium tracking-wide animate-pulse">O Chef de IA está ouvindo o TikTok e anotando tudo...</p>
-                <p className="text-sm text-slate-500 max-w-sm mx-auto animate-pulse">Vídeos curtos levam ~15s. Vídeos maiores (2-3 min) podem levar até 1 minuto. ⚡</p>
+                <p className="text-slate-600 font-medium tracking-wide animate-pulse">{stageText}</p>
+
+                {isLongVideo && (
+                  <div className="max-w-md mx-auto px-5 py-4 rounded-2xl bg-amber-50 border border-amber-200 text-amber-900 text-sm font-medium">
+                    Este vídeo é grande ({Math.round(videoInfo.duration / 60)} min), por isso pode demorar um pouco mais
+                    — cerca de {formatSeconds(estimate)}. Deixe esta página aberta. ⏳
+                  </div>
+                )}
+
+                {/* Contagem */}
+                <div className="w-full max-w-sm mx-auto space-y-2">
+                  <div className="h-2 w-full rounded-full bg-slate-200 overflow-hidden">
+                    <div
+                      className={`h-full rounded-full transition-all duration-1000 ease-linear ${isLongVideo ? 'bg-amber-500' : 'bg-blue-600'}`}
+                      style={{ width: `${progress}%` }}
+                    ></div>
+                  </div>
+                  <p className="text-sm text-slate-500 tabular-nums">
+                    {remaining > 0
+                      ? `Faltam cerca de ${formatSeconds(remaining)}`
+                      : 'Quase pronto, finalizando a receita...'}
+                    {' · '}{formatSeconds(elapsed)} decorridos
+                  </p>
+                </div>
+
+                {!isLongVideo && !videoInfo && (
+                  <p className="text-sm text-slate-500 max-w-sm mx-auto">Vídeos curtos levam ~15s. Vídeos maiores podem levar alguns minutos. ⚡</p>
+                )}
               </div>
             )}
           </div>

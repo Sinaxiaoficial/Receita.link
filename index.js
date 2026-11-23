@@ -49,7 +49,8 @@ O conteúdo pode vir de MÚLTIPLAS fontes: áudio/narração do vídeo, texto vi
 5. O título DEVE ser extraído do vídeo ou da legenda. Se não mencionado, descreva de forma direta (ex: "Bolo de Chocolate").
 6. Para ingredientes, quantidades e modo de preparo: extraia SOMENTE o que é explicitamente dito, mostrado ou escrito na legenda. Para calorias (kcal), você PODE estimar com base em valores nutricionais padrão — mas NUNCA invente ingredientes ou passos.
 7. Escreva o modo de preparo com ortografia, gramática e concordância corretas no português, mesmo que a pessoa no vídeo fale com gírias, erros ou de forma informal.
-8. Se o vídeo contém MÚLTIPLAS receitas (compilação), extraia apenas a PRIMEIRA receita completa identificada (com ingredientes e modo de preparo). Ignore as demais receitas do vídeo.`;
+8. Se o vídeo contém MÚLTIPLAS receitas (compilação), extraia apenas a PRIMEIRA receita completa identificada (com ingredientes e modo de preparo). Ignore as demais receitas do vídeo.
+9. A lista de ingredientes NUNCA pode ficar vazia se algum ingrediente for usado no vídeo. Em vídeos longos, a pessoa costuma citar os ingredientes aos poucos, enquanto cozinha, sem fazer uma lista no começo. Nesse caso, junte na lista TODOS os ingredientes que ela cita ou usa em qualquer momento do vídeo (inclusive os que aparecem só no modo de preparo), com a quantidade que ela disser. Se não disser a quantidade, use "A gosto" ou "Quantidade não especificada". Isso não é inventar: é listar o que foi dito ou mostrado.`;
 
 const RECIPE_SCHEMA = {
   type: Type.OBJECT,
@@ -92,6 +93,21 @@ const RECIPE_SCHEMA = {
     }
   }
 };
+
+const INGREDIENTS_SCHEMA = {
+  type: Type.OBJECT,
+  properties: {
+    ingredientes: RECIPE_SCHEMA.properties.ingredientes,
+    calorias_totais: { type: Type.STRING }
+  }
+};
+
+// Vídeo a partir deste tamanho (em segundos) é "longo": a tela avisa que pode demorar mais.
+const LONG_VIDEO_SECONDS = 600;
+
+function countIngredients(recipe) {
+  return (recipe?.ingredientes || []).reduce((n, sec) => n + ((sec && sec.itens) ? sec.itens.length : 0), 0);
+}
 
 // ========================================================================
 // Retry com Backoff — protege contra 503/429 do Gemini
@@ -180,13 +196,15 @@ async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
 
     // Aguardar processamento do arquivo se necessário
     let file = uploadResult;
-    let waitCount = 0;
+    // Vídeos longos levam mais tempo para o Gemini preparar. Espera até 2 minutos,
+    // conferindo a cada 1s (antes eram só ~15s, pouco para vídeos de 10+ minutos).
+    const waitStart = Date.now();
     while (file.state === 'PROCESSING') {
-      if (waitCount++ > 10) throw new Error('File API: timeout aguardando processamento');
-      console.log('[File API] ⏳ Aguardando processamento...');
-      await new Promise(r => setTimeout(r, 1500));
+      if (Date.now() - waitStart > 120000) throw new Error('File API: timeout aguardando processamento');
+      await new Promise(r => setTimeout(r, 1000));
       file = await ai.files.get({ name: file.name });
     }
+    console.log(`[File API] ✅ Arquivo pronto (${((Date.now() - waitStart) / 1000).toFixed(1)}s de processamento)`);
 
     if (file.state === 'FAILED') {
       throw new Error('File API: processamento do arquivo falhou');
@@ -262,8 +280,35 @@ async function fetchTikWMMeta(url) {
     ua,
     author: data.author?.unique_id || null,
     title: data.title || null,
-    description: data.title || ''
+    description: data.title || '',
+    duration: Number(data.duration) || 0, // segundos
+    size: Number(data.size) || 0          // bytes
   };
+}
+
+// Guarda por 2 minutos os dados do vídeo buscados pela rota /api/recipe/info,
+// para a rota principal não precisar perguntar de novo ao TikWM (economiza ~1s).
+const metaCache = new Map();
+const META_TTL_MS = 2 * 60 * 1000;
+
+async function getTikWMMeta(url) {
+  const key = getCacheKey(url);
+  const entry = metaCache.get(key);
+  if (entry && Date.now() - entry.timestamp < META_TTL_MS) {
+    console.log('[TikWM] ✅ Dados do vídeo reaproveitados');
+    return entry.meta;
+  }
+  const meta = await fetchTikWMMeta(url);
+  if (metaCache.size > 200) metaCache.delete(metaCache.keys().next().value);
+  metaCache.set(key, { meta, timestamp: Date.now() });
+  return meta;
+}
+
+// Tempo limite do download proporcional ao tamanho: vídeos longos têm 50MB+ e
+// não cabiam nos 30s fixos de antes.
+function downloadTimeoutMs(sizeBytes) {
+  const sizeMB = (sizeBytes || 0) / (1024 * 1024);
+  return Math.min(150000, Math.max(30000, 30000 + sizeMB * 1500));
 }
 
 async function downloadTikWMVideo(meta) {
@@ -274,7 +319,7 @@ async function downloadTikWMVideo(meta) {
     url: meta.videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000,
+    timeout: downloadTimeoutMs(meta.size),
     headers: { 'User-Agent': meta.ua }
   });
 
@@ -288,7 +333,8 @@ async function downloadTikWMVideo(meta) {
     type: 'video',
     author: meta.author,
     title: meta.title,
-    description: meta.description
+    description: meta.description,
+    duration: meta.duration
   };
 }
 
@@ -329,7 +375,7 @@ async function downloadViaTikWMPost(url) {
     url: videoUrl,
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000,
+    timeout: 120000,
     headers: { 'User-Agent': ua }
   });
 
@@ -378,7 +424,7 @@ async function downloadViaTTSave(url) {
     url: downloadMatch[1],
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000,
+    timeout: 120000,
     headers: { 'User-Agent': ua }
   });
 
@@ -436,7 +482,7 @@ async function downloadViaTikCDN(url) {
     url: downloadMatch[1],
     method: 'GET',
     responseType: 'arraybuffer',
-    timeout: 30000,
+    timeout: 120000,
     headers: { 'User-Agent': ua, 'Referer': 'https://ssstik.io/' }
   });
 
@@ -616,6 +662,37 @@ app.post('/api/recipe/audio', upload.single('audio'), async (req, res) => {
   }
 });
 
+// Normaliza o link colado (tira texto em volta e pontuação no fim).
+function cleanTikTokUrl(url) {
+  const urlMatch = String(url || '').match(/(https?:\/\/[^\s]+)/);
+  if (urlMatch) url = urlMatch[0];
+  return String(url || '').replace(/[,.!?;:]+$/, '').trim();
+}
+
+/**
+ * Rota rápida (~1s) que a tela chama antes da principal: diz a duração do vídeo,
+ * para avisar quando ele é longo e mostrar uma contagem de tempo adequada.
+ * Se a receita já estiver no cache, devolve a receita direto.
+ */
+app.post('/api/recipe/info', async (req, res) => {
+  let url = cleanTikTokUrl(req.body?.url);
+  if (!/tiktok\.com/i.test(url)) return res.status(400).json({ error: 'Link inválido.', errorCode: 'INVALID_URL' });
+  try {
+    url = await resolveShortUrl(url);
+    const cached = getCachedRecipe(url);
+    if (cached) return res.json({ cached: true, recipe: cached });
+    const meta = await getTikWMMeta(url);
+    res.json({
+      duration: meta.duration || null,
+      longVideo: (meta.duration || 0) >= LONG_VIDEO_SECONDS,
+      captionHasRecipe: captionLooksLikeRecipe(meta.description)
+    });
+  } catch (err) {
+    // Não é grave: a tela só não mostra o aviso de vídeo longo.
+    res.json({ duration: null, longVideo: false });
+  }
+});
+
 app.post('/api/recipe/url', async (req, res) => {
   let { url } = req.body;
   if (!url) return res.status(400).json({ error: "URL é obrigatória.", errorCode: 'INVALID_INPUT' });
@@ -656,7 +733,8 @@ app.post('/api/recipe/url', async (req, res) => {
     //    logo em seguida e corre em paralelo com a leitura da legenda.
     let meta = null;
     try {
-      meta = await fetchTikWMMeta(url);
+      meta = await getTikWMMeta(url);
+      if (meta.duration) console.log(`[TikWM] 🎬 Vídeo de ${Math.round(meta.duration / 60)} min (${(meta.size / (1024 * 1024)).toFixed(1)}MB)`);
     } catch (metaErr) {
       console.warn(`[TikWM] ⚠️  ${metaErr.message} — usando provedores alternativos`);
     }
@@ -756,7 +834,9 @@ app.post('/api/recipe/url', async (req, res) => {
         mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
         thinkingConfig: { thinkingBudget: 0 },
         temperature: 0,
-        maxOutputTokens: 4000
+        // Receitas de vídeos longos são maiores; 4000 cortava a resposta no meio.
+        // O limite maior não deixa as receitas curtas mais lentas.
+        maxOutputTokens: 8192
       }
     }));
 
@@ -785,6 +865,47 @@ app.post('/api/recipe/url', async (req, res) => {
         error: 'O vídeo não parece conter uma receita completa. Tente com um vídeo que mostre ingredientes e modo de preparo.',
         errorCode: 'NO_RECIPE'
       });
+    }
+
+    // ── Receita sem ingredientes (acontecia em vídeos longos, de 10+ minutos) ──
+    // A pessoa cita os ingredientes aos poucos durante o vídeo, e a IA trazia só o
+    // modo de preparo. Pedimos de novo SÓ os ingredientes, do mesmo vídeo, deixando a
+    // IA "pensar" um pouco para varrer o vídeo inteiro. Só roda quando faltou.
+    const elapsedSoFar = Date.now() - startTime;
+    if (countIngredients(recipeData) === 0 && elapsedSoFar < 200000) {
+      console.warn('[Gemini] ⚠️  Receita veio sem ingredientes — buscando os ingredientes de novo');
+      const ingStart = Date.now();
+      try {
+        const ingResponse = await callGeminiWithRetry(() => ai.models.generateContent({
+          model: MODEL,
+          contents: [{
+            role: 'user',
+            parts: [
+              contentParts[0],
+              { text: `Liste TODOS os ingredientes usados nesta receita ("${recipeData.titulo}"). Assista ao vídeo INTEIRO: a pessoa pode citar os ingredientes aos poucos, enquanto cozinha, e não numa lista. Inclua cada ingrediente citado, usado ou mostrado em qualquer momento, com a quantidade dita (ou "A gosto"/"Quantidade não especificada"). Estime as calorias (kcal) de cada um.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}\n\nModo de preparo já extraído, para conferência:\n${JSON.stringify(recipeData.modo_preparo)}` }
+            ]
+          }],
+          config: {
+            systemInstruction: SYSTEM_INSTRUCTION,
+            responseMimeType: "application/json",
+            responseSchema: INGREDIENTS_SCHEMA,
+            mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
+            thinkingConfig: { thinkingBudget: 2048 },
+            temperature: 0,
+            maxOutputTokens: 8192
+          }
+        }));
+        const ingData = JSON.parse(ingResponse.text);
+        if (countIngredients(ingData) > 0) {
+          recipeData.ingredientes = ingData.ingredientes;
+          if (!recipeData.calorias_totais && ingData.calorias_totais) recipeData.calorias_totais = ingData.calorias_totais;
+          console.log(`[Gemini] ✅ ${countIngredients(ingData)} ingredientes recuperados em ${((Date.now() - ingStart) / 1000).toFixed(1)}s`);
+        } else {
+          console.warn('[Gemini] ⚠️  Segunda tentativa também sem ingredientes');
+        }
+      } catch (ingErr) {
+        console.warn(`[Gemini] ⚠️  Falha ao buscar ingredientes: ${ingErr.message}`);
+      }
     }
 
     // Adicionar créditos do autor
