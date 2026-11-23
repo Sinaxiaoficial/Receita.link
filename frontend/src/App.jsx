@@ -90,7 +90,7 @@ function App() {
       // 1. Pergunta rápida: duração do vídeo (para o aviso de vídeo longo).
       //    Se falhar ou demorar, segue normalmente sem o aviso.
       try {
-        const infoRes = await axios.post(`${apiUrl}/api/recipe/info`, { url }, { timeout: 4000 });
+        const infoRes = await axios.post(`${apiUrl}/api/recipe/info`, { url }, { timeout: 8000 });
         if (infoRes.data?.cached && infoRes.data.recipe) {
           setRecipe(infoRes.data.recipe);
           return;

@@ -662,6 +662,13 @@ app.post('/api/recipe/audio', upload.single('audio'), async (req, res) => {
   }
 });
 
+// O autor vem do próprio link (tiktok.com/@autor/video/...). É mais confiável que o
+// dos provedores alternativos, que às vezes pegavam lixo da página (ex: "@media" do CSS).
+function authorFromUrl(url) {
+  const m = String(url || '').match(/tiktok\.com\/@([A-Za-z0-9_.]+)/i);
+  return m ? m[1] : null;
+}
+
 // Normaliza o link colado (tira texto em volta e pontuação no fim).
 function cleanTikTokUrl(url) {
   const urlMatch = String(url || '').match(/(https?:\/\/[^\s]+)/);
@@ -750,7 +757,7 @@ app.post('/api/recipe/url', async (req, res) => {
 
     // 2. ROTA RÁPIDA: legenda com receita → responde sem esperar o vídeo
     if (meta && captionLooksLikeRecipe(meta.description)) {
-      const captionRecipe = await extractRecipeFromCaption(meta.description, meta.author);
+      const captionRecipe = await extractRecipeFromCaption(meta.description, authorFromUrl(url) || meta.author);
       if (captionRecipe) {
         setCachedRecipe(url, captionRecipe);
         const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -786,7 +793,7 @@ app.post('/api/recipe/url', async (req, res) => {
 
     // Legenda vinda de um provedor alternativo (o TikWM falhou, então ela ainda não foi lida)
     if (!meta && captionLooksLikeRecipe(mediaData.description)) {
-      const captionRecipe = await extractRecipeFromCaption(mediaData.description, mediaData.author);
+      const captionRecipe = await extractRecipeFromCaption(mediaData.description, authorFromUrl(url) || mediaData.author);
       if (captionRecipe) {
         setCachedRecipe(url, captionRecipe);
         const totalElapsed = ((Date.now() - startTime) / 1000).toFixed(1);
@@ -909,10 +916,9 @@ app.post('/api/recipe/url', async (req, res) => {
     }
 
     // Adicionar créditos do autor
-    if (mediaData.author) {
-      recipeData.creditos_autor = mediaData.author.startsWith('@')
-        ? mediaData.author
-        : `@${mediaData.author}`;
+    const author = authorFromUrl(url) || mediaData.author;
+    if (author) {
+      recipeData.creditos_autor = author.startsWith('@') ? author : `@${author}`;
     }
 
     // Armazenar no cache
