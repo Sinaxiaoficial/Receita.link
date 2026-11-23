@@ -124,14 +124,29 @@ function mp4DurationSeconds(buffer) {
   }
 }
 
-// Lista de ingredientes sem NENHUMA quantidade, mas o modo de preparo tem números:
-// sinal de que a IA deixou as quantidades só nos passos.
-function ingredientsMissingQuantities(recipe) {
+// Um ingrediente "tem quantidade" se traz número, fração, medida ou "a gosto".
+const QTY_RE = /\d|½|¼|¾|⅓|⅔|\bmei[ao]\b|\bum\b|\buma\b|\bdois\b|\bduas\b|\btrês\b|\bquatro\b|\bcinco\b|\bseis\b|\bsete\b|\boito\b|\bnove\b|\bdez\b|\bdúzia|x[íi]cara|colher|pitada|copo|lata|pacote|caixa|dente|\bfio\b|gota|punhado|ma[çc]o|tablete|\bgramas?\b|\bkg\b|\bml\b|litro|a gosto|quantidade não/i;
+
+// Quantos ingredientes vieram SEM quantidade (ex: "Ovos" em vez de "4 ovos").
+function ingredientsWithoutQuantity(recipe) {
   const items = (recipe?.ingredientes || []).flatMap(sec => (sec && sec.itens) || []);
-  if (items.length === 0) return false;
-  const hasQty = items.some(it => /\d|½|¼|¾|meia|meio|uma|um |dois|duas|três|quatro|cinco|xícara|colher|pitada|copo|lata/i.test(it.descricao || ''));
-  const stepsText = JSON.stringify(recipe.modo_preparo || []);
-  return !hasQty && /\d/.test(stepsText);
+  return { total: items.length, missing: items.filter(it => !QTY_RE.test(it.descricao || '')).length };
+}
+
+// "2865" → "2865 kcal" (a tela mostrava o total sem a unidade).
+function withKcal(v) {
+  if (v === undefined || v === null) return v;
+  const str = String(v).trim();
+  return /^[~≈]?\s*[\d.,]+$/.test(str) ? `${str} kcal` : str;
+}
+
+function normalizeRecipe(recipe) {
+  if (!recipe) return recipe;
+  if (recipe.calorias_totais) recipe.calorias_totais = withKcal(recipe.calorias_totais);
+  for (const sec of recipe.ingredientes || []) {
+    for (const it of (sec && sec.itens) || []) if (it.kcal) it.kcal = withKcal(it.kcal);
+  }
+  return recipe;
 }
 
 function countIngredients(recipe) {
@@ -245,6 +260,31 @@ async function uploadToGeminiFileAPI(rawBuffer, mimeType, type) {
       try { fs.unlinkSync(tmpPath); } catch (e) {}
     }
   }
+}
+
+/**
+ * Transcreve a FALA do vídeo em texto. Em vídeo longo a IA, olhando o vídeo direto,
+ * às vezes escreve só "Ovos" em vez de "4 ovos". Num texto escrito a quantidade
+ * fica clara, e dele a lista de ingredientes sai com as quantidades certas.
+ */
+async function transcribeSpeech(mediaPart) {
+  const t0 = Date.now();
+  const response = await callGeminiWithRetry(() => ai.models.generateContent({
+    model: MODEL,
+    contents: [{ role: 'user', parts: [
+      mediaPart,
+      { text: 'Transcreva em português, palavra por palavra, TUDO o que é falado neste vídeo, do começo ao fim, sem resumir e sem pular nada. Escreva os números como a pessoa falou (ex: "meia xícara", "4 ovos", "450 gramas"). Se aparecer na tela algum texto com ingrediente ou quantidade, coloque-o entre colchetes no ponto em que aparece. Responda só com a transcrição.' }
+    ] }],
+    config: {
+      mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
+      thinkingConfig: { thinkingBudget: 0 },
+      temperature: 0,
+      maxOutputTokens: 16000
+    }
+  }));
+  const text = (response.text || '').trim();
+  console.log(`[Transcrição] 📝 ${text.length} caracteres em ${((Date.now() - t0) / 1000).toFixed(1)}s`);
+  return text;
 }
 
 // ========================================================================
@@ -620,6 +660,7 @@ async function extractRecipeFromCaption(description, author) {
       && textResult.modo_preparo.some(sec => sec.passos && sec.passos.length > 0);
 
     if (!textResult.erro && textResult.titulo && hasIngredients && hasSteps) {
+      normalizeRecipe(textResult);
       if (author) {
         textResult.creditos_autor = author.startsWith('@') ? author : `@${author}`;
       }
@@ -902,6 +943,12 @@ app.post('/api/recipe/url', async (req, res) => {
       ];
     }
 
+    // Vídeo longo: a transcrição da fala começa JUNTO com a receita (não atrasa nada).
+    // Ela só é usada se a lista de ingredientes vier sem quantidades.
+    let transcriptPromise = isLongVideo
+      ? transcribeSpeech(contentParts[0]).catch(err => { console.warn(`[Transcrição] ⚠️  ${err.message}`); return ''; })
+      : null;
+
     const response = await callGeminiWithRetry(() => ai.models.generateContent({
       model: MODEL,
       contents: [{ role: 'user', parts: contentParts }],
@@ -948,47 +995,61 @@ app.post('/api/recipe/url', async (req, res) => {
       });
     }
 
-    // ── Receita sem ingredientes (acontecia em vídeos longos, de 10+ minutos) ──
-    // A pessoa cita os ingredientes aos poucos durante o vídeo, e a IA trazia só o
-    // modo de preparo. Pedimos de novo SÓ os ingredientes, do mesmo vídeo, deixando a
-    // IA "pensar" um pouco para varrer o vídeo inteiro. Só roda quando faltou.
+    // ── Ingredientes sem quantidade (ou sem ingredientes) ──
+    // Em vídeos longos a pessoa fala as quantidades aos poucos, enquanto cozinha, e a
+    // IA às vezes lista só "Ovos, Óleo...". Nesse caso a lista é refeita a partir da
+    // TRANSCRIÇÃO da fala, onde "4 ovos" e "meia xícara de óleo" estão escritos.
     const elapsedSoFar = Date.now() - startTime;
-    const noIngredients = countIngredients(recipeData) === 0;
-    if ((noIngredients || ingredientsMissingQuantities(recipeData)) && elapsedSoFar < 200000) {
-      console.warn(`[Gemini] ⚠️  Receita veio ${noIngredients ? 'sem ingredientes' : 'sem quantidades nos ingredientes'} — buscando os ingredientes de novo`);
-      const ingStart = Date.now();
+    const qty = ingredientsWithoutQuantity(recipeData);
+    const needsFix = qty.total === 0
+      || (isLongVideo ? qty.missing > 0 : qty.missing / qty.total > 0.5);
+    if (needsFix && elapsedSoFar < 220000) {
+      console.warn(`[Gemini] ⚠️  Ingredientes: ${qty.total} itens, ${qty.missing} sem quantidade — refazendo a lista pela transcrição`);
+      const fixStart = Date.now();
       try {
+        const transcript = await (transcriptPromise || transcribeSpeech(contentParts[0]).catch(() => ''));
+        // Sem transcrição (falhou): a IA olha o vídeo de novo, só atrás dos ingredientes.
+        const source = transcript
+          ? `--- TRANSCRIÇÃO DA FALA DO VÍDEO ---\n${transcript}`
+          : '--- A FONTE É O VÍDEO ACIMA: assista e ouça ele INTEIRO ---';
         const ingResponse = await callGeminiWithRetry(() => ai.models.generateContent({
           model: MODEL,
-          contents: [{
-            role: 'user',
-            parts: [
-              contentParts[0],
-              { text: `Liste TODOS os ingredientes usados nesta receita ("${recipeData.titulo}"). Assista ao vídeo INTEIRO: a pessoa pode citar os ingredientes aos poucos, enquanto cozinha, e não numa lista. Inclua cada ingrediente citado, usado ou mostrado em qualquer momento, com a quantidade dita (ou "A gosto"/"Quantidade não especificada"). Estime as calorias (kcal) de cada um.${mediaData.description ? `\n\n--- LEGENDA/DESCRIÇÃO DO VÍDEO ---\n${mediaData.description}` : ''}\n\nModo de preparo já extraído, para conferência:\n${JSON.stringify(recipeData.modo_preparo)}` }
-            ]
-          }],
+          contents: [{ role: 'user', parts: [...(transcript ? [] : [contentParts[0]]), { text:
+`Monte a lista COMPLETA de ingredientes da receita "${recipeData.titulo}" com a QUANTIDADE EXATA de cada um, como foi dita no vídeo (ex: "4 ovos", "1/2 xícara de óleo", "1/2 colher de sopa de sal", "450 g de polvilho doce").
+- Procure no conteúdo inteiro: a quantidade pode ser dita em qualquer momento (às vezes depois, ao colocar o ingrediente).
+- Se a pessoa disser a quantidade aos poucos (ex: "mais um pouco"), use o total que ela disser; se não disser, use "A gosto" ou "Quantidade não especificada".
+- Não invente ingrediente nem quantidade. Estime as calorias (kcal) de cada ingrediente pela quantidade.
+
+${source}
+${mediaData.description ? `\n--- LEGENDA DO VÍDEO ---\n${mediaData.description}\n` : ''}
+--- MODO DE PREPARO JÁ EXTRAÍDO ---
+${JSON.stringify(recipeData.modo_preparo)}` }] }],
           config: {
             systemInstruction: SYSTEM_INSTRUCTION,
             responseMimeType: "application/json",
             responseSchema: INGREDIENTS_SCHEMA,
             mediaResolution: MediaResolution.MEDIA_RESOLUTION_LOW,
-            thinkingConfig: { thinkingBudget: 2048 },
+            thinkingConfig: { thinkingBudget: transcript ? 1024 : 2048 },
             temperature: 0,
             maxOutputTokens: 8192
           }
         }));
         const ingData = JSON.parse(ingResponse.text);
-        if (countIngredients(ingData) > 0) {
+        const newQty = ingredientsWithoutQuantity(ingData);
+        if (newQty.total > 0 && (qty.total === 0 || newQty.missing < qty.missing)) {
           recipeData.ingredientes = ingData.ingredientes;
-          if (!recipeData.calorias_totais && ingData.calorias_totais) recipeData.calorias_totais = ingData.calorias_totais;
-          console.log(`[Gemini] ✅ ${countIngredients(ingData)} ingredientes recuperados em ${((Date.now() - ingStart) / 1000).toFixed(1)}s`);
+          if (ingData.calorias_totais) recipeData.calorias_totais = ingData.calorias_totais;
+          console.log(`[Gemini] ✅ Lista refeita: ${newQty.total} itens, ${newQty.missing} sem quantidade (${((Date.now() - fixStart) / 1000).toFixed(1)}s)`);
         } else {
-          console.warn('[Gemini] ⚠️  Segunda tentativa também sem ingredientes');
+          console.warn(`[Gemini] ⚠️  Lista refeita não ficou melhor (${newQty.total} itens, ${newQty.missing} sem quantidade) — mantendo a primeira`);
         }
-      } catch (ingErr) {
-        console.warn(`[Gemini] ⚠️  Falha ao buscar ingredientes: ${ingErr.message}`);
+      } catch (fixErr) {
+        console.warn(`[Gemini] ⚠️  Falha ao refazer os ingredientes: ${fixErr.message}`);
       }
     }
+    transcriptPromise = null;
+
+    normalizeRecipe(recipeData);
 
     // Adicionar créditos do autor
     const author = authorFromUrl(url) || mediaData.author;
